@@ -40,6 +40,11 @@ Your answer is saved automatically to `answers/NNN.sql`.
 
 **Schema tab** (left): browse tables and columns. Select a column to insert its name.
 
+**Labs** (⚗, Level 6): `Ctrl+R` runs every statement in the editor (autocommit, as the
+superuser, with psql's output). `Ctrl+T` checks the database state. In *script* labs it runs your
+script as the lab's role inside a transaction and rolls back. *Reset this lab* (command palette)
+starts a lab over.
+
 **Performance questions** (⏱): create indexes or materialized views in a psql shell
 (`./dojo psql` in another terminal), then check. Your query runs 3 times and the best time counts.
 Undo everything with *Reset objects I created* in the command palette.
@@ -175,6 +180,7 @@ class DojoApp(App):
     #bottom { height: 2fr; min-height: 8; }
     #result-info { height: auto; padding: 0 1; }
     #results { height: 1fr; }
+    #script-out { height: 1fr; display: none; }
     #check-log, #plan-log { height: 1fr; }
     #hints-md { padding: 0 1; }
     HelpScreen, SolutionScreen, ConfirmScreen, SetupScreen { align: center middle; }
@@ -234,6 +240,7 @@ class DojoApp(App):
                     with TabPane("Results", id="tab-results"):
                         yield Static("[dim]Run your query with Ctrl+R (or F5).[/dim]", id="result-info")
                         yield DataTable(id="results", zebra_stripes=True, cursor_type="row")
+                        yield RichLog(id="script-out", wrap=False, markup=False, highlight=False)
                     with TabPane("Check", id="tab-check"):
                         yield RichLog(id="check-log", wrap=True, markup=False)
                     with TabPane("Plan", id="tab-plan"):
@@ -270,7 +277,8 @@ class DojoApp(App):
                 mark = Text("… ", style="yellow")
             else:
                 mark = Text("  ")
-            label = Text.assemble(mark, (f"{q.id:>2} ", "dim"), q.title, (" ⏱" if q.is_perf else "", "yellow"))
+            badge = (" ⏱", "yellow") if q.is_perf else ((" ⚗", "magenta") if q.is_lab else ("", ""))
+            label = Text.assemble(mark, (f"{q.id:>2} ", "dim"), q.title, badge)
             ol.add_option(Option(label, id=f"q{q.id}"))
         if highlighted is not None:
             ol.highlighted = highlighted
@@ -294,7 +302,15 @@ class DojoApp(App):
         self.query_one("#question-scroll").scroll_home(animate=False)
         self.render_hints()
         self.query_one("#results", DataTable).clear(columns=True)
-        self.query_one("#result-info", Static).update("[dim]Run your query with Ctrl+R (or F5).[/dim]")
+        self.query_one("#results").display = not q.is_lab
+        self.query_one("#script-out", RichLog).clear()
+        self.query_one("#script-out").display = q.is_lab
+        self.query_one("#result-info", Static).update(
+            "[dim]Ctrl+R runs every statement in the editor (autocommit, as the superuser).[/dim]"
+            if q.kind == "state" else
+            f"[dim]Ctrl+R runs your script as yourself (superuser, autocommit). Ctrl+T runs it as "
+            f"{q.run_as} and rolls back.[/dim]" if q.kind == "script" else
+            "[dim]Run your query with Ctrl+R (or F5).[/dim]")
         self.query_one("#check-log", RichLog).clear()
         self.query_one("#plan-log", RichLog).clear()
         self.query_one("#bottom", TabbedContent).active = "tab-results"
@@ -304,6 +320,17 @@ class DojoApp(App):
         except Exception:
             pass
         self.set_status(f"answers/{q.code}.sql")
+        if q.setup_path and self.meta:
+            self.ensure_lab(q)
+
+    @work(thread=True, exclusive=True, group="lab")
+    def ensure_lab(self, q: core.Question, force: bool = False) -> None:
+        try:
+            if force or not core.lab_is_set_up(q):
+                core.setup_lab(q)
+                self.call_from_thread(self.notify, f"Lab for Q{q.code} is ready.")
+        except DojoError as e:
+            self.call_from_thread(self.notify, str(e), severity="error", timeout=10)
 
     def render_hints(self) -> None:
         q = self.current
@@ -363,7 +390,14 @@ class DojoApp(App):
 
     # --------------------------------------------------------------- actions
     def action_run(self) -> None:
-        if self._can_query():
+        if self._can_query() and self.current.is_lab:
+            self.busy = True
+            self.query_one("#bottom", TabbedContent).active = "tab-results"
+            out = self.query_one("#script-out", RichLog)
+            out.clear()
+            out.write(Text("Running...", style="dim"))
+            self.run_script_worker(self.query_one("#editor", TextArea).text)
+        elif self._can_query():
             self.busy = True
             self.query_one("#bottom", TabbedContent).active = "tab-results"
             self.query_one("#results", DataTable).loading = True
@@ -376,6 +410,27 @@ class DojoApp(App):
             self.call_from_thread(self.show_result, res, None)
         except DojoError as e:
             self.call_from_thread(self.show_result, None, str(e))
+
+    @work(thread=True, exclusive=True, group="db")
+    def run_script_worker(self, sql: str) -> None:
+        try:
+            output, error = core.run_script(sql), None
+        except DojoError as e:
+            output, error = "", str(e)
+        self.call_from_thread(self.show_script_output, output, error)
+
+    def show_script_output(self, output: str, error: Optional[str]) -> None:
+        self.busy = False
+        out = self.query_one("#script-out", RichLog)
+        out.clear()
+        for line in (error or output or "(no output)").splitlines():
+            if error or line.startswith(("ERROR", "FATAL")):
+                style = "red"
+            elif line.startswith(("Time:", "NOTICE", "WARNING", "INFO", "DETAIL", "HINT")):
+                style = "dim"
+            else:
+                style = ""
+            out.write(Text(line, style=style))
 
     def show_result(self, res: Optional[core.Result], error: Optional[str]) -> None:
         self.busy = False
@@ -417,8 +472,23 @@ class DojoApp(App):
             log.write(Text(error or "unknown error", style="red"))
             return
         if g.error:
-            log.write(Text("✘ Your query failed:", style="bold red"))
+            title = {"query": "✘ Your query failed:", "script": "✘ Your script failed:"}.get(q.kind, "✘ Not checked:")
+            log.write(Text(title, style="bold red"))
             log.write(Text(g.error, style="red"))
+            self.refresh_question_list()
+            return
+        if q.is_lab:
+            if g.output:
+                self.show_script_output(g.output, None)
+            for name, ok, detail in g.checks:
+                log.write(Text.assemble(("✔ " if ok else "✘ ", "green" if ok else "red"), name,
+                                        (f"  ({detail})" if detail else "", "dim")))
+            if g.passed:
+                log.write(Text(f"✔ Lab complete!   attempt {g.attempts}", style="bold green"))
+                log.write(Text("Ctrl+O: read the explanation   Ctrl+N: next question", style="dim"))
+                self.notify(f"Q{q.code} complete!" if g.first_solve else "Still passing!", title="✔ Lab complete")
+            else:
+                log.write(Text("✘ Not yet.", style="bold red"))
             self.refresh_question_list()
             return
         self.show_result(g.actual, None)
@@ -444,6 +514,9 @@ class DojoApp(App):
         self.refresh_question_list()
 
     def action_explain(self, analyze: bool = True) -> None:
+        if self.current is not None and self.current.is_lab:
+            self.notify("Explain works on single queries. In a lab, put EXPLAIN in the editor and run it.")
+            return
         if self._can_query():
             self.busy = True
             log = self.query_one("#plan-log", RichLog)
@@ -529,6 +602,8 @@ class DojoApp(App):
         self.set_status(f"answers/{self.current.code}.sql" if self.current else "")
         if meta:
             self.load_schema()
+            if self.current is not None and self.current.setup_path:
+                self.ensure_lab(self.current)
         else:
             self.push_screen(SetupScreen(), self.setup_done)
 
@@ -570,6 +645,9 @@ class DojoApp(App):
                             lambda: self.push_screen(SetupScreen(regenerate=True), self.setup_done))
         yield SystemCommand("Reset objects I created", "Drop your indexes, views and tables",
                             self.reset_objects)
+        if self.current is not None and self.current.setup_path:
+            yield SystemCommand("Reset this lab", f"Rebuild the lab objects for Q{self.current.code}",
+                                lambda: self.ensure_lab(self.current, force=True))
         yield SystemCommand("Explain (plan only)", "EXPLAIN without running the query",
                             lambda: self.action_explain(analyze=False))
         yield SystemCommand("Next unsolved question", "Jump ahead", self.action_next)

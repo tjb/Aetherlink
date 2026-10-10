@@ -48,6 +48,28 @@ Put the original slow (but correct) query in `expected.sql`. It's what grading c
 so it must finish in reasonable time *without* any extra indexes. `solution.sql` lists the setup
 (`CREATE INDEX ...`) in comments, followed by the fast query.
 
+## Labs (`kind: script` / `kind: state`)
+
+Labs are graded by inspecting the database instead of comparing a result:
+
+```
+questions/035-my-lab/
+├── question.md     front matter adds `kind: script` (and `run_as: some_role`) or `kind: state`
+├── setup.sql       idempotent: (re)creates the lab's objects in schema `lab`, plus any roles
+├── check.sql       returns rows (check text, ok boolean, detail text). All ok = solved
+└── solution.sql    a script that passes the checks, with the explanation in comments
+```
+
+- **script**: the answer file is a script. Each check runs `setup.sql`, then `BEGIN; SET LOCAL ROLE
+  <run_as>; <your script>; RESET ROLE; <check.sql>; ROLLBACK;`. Transaction control and role
+  switching are refused in the script.
+- **state**: the learner changes the database however they like. `check.sql` runs on the current
+  state and may use its own `BEGIN ... ROLLBACK` to try things (see Q039). `setup.sql` runs when
+  the lab is first opened and on *Reset this lab*.
+- `check.sql` must return a single result set. Other statements in it must not print anything.
+- A query question can also have a `setup.sql` (for example to create roles, see Q038).
+- `./dojo selftest` checks that the solution passes *and* that doing nothing fails.
+
 ## Check your work
 
 ```bash

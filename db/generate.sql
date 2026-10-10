@@ -48,6 +48,7 @@ WHERE gcd(m, :n_products) = 1
 DROP TABLE IF EXISTS events, reviews, order_items, orders, subscriptions,
                      product_prices, products, categories, users CASCADE;
 DROP SCHEMA IF EXISTS _dojo CASCADE;
+DROP SCHEMA IF EXISTS lab CASCADE;  -- Level 6 labs are rebuilt on demand
 CREATE SCHEMA _dojo;
 
 -- Uniform [0,1) "random" number derived from a key and a salt.

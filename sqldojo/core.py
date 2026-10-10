@@ -30,7 +30,15 @@ LEVELS = {
     3: "Analytics patterns",
     4: "Advanced SQL",
     5: "Performance",
+    6: "Production Postgres",
 }
+# kind of question:
+#   query   one SELECT, graded by comparing its result with the reference
+#   script  a migration-style script, run as a restricted role inside a transaction that is
+#           rolled back; check.sql then inspects the state it produced
+#   state   you change the database yourself (any statements, any way you like);
+#           check.sql inspects the result
+KINDS = ("query", "script", "state")
 DATASET_TABLES = ["users", "categories", "products", "product_prices", "orders",
                   "order_items", "events", "reviews", "subscriptions"]
 NULL = "<NULL>"
@@ -63,6 +71,12 @@ class Question:
         self.target_ms = float(meta["target_ms"]) if "target_ms" in meta else None
         self.target_scaling = meta.get("target_scaling", "constant")
         self.prompt, self.hints = _split_hints(body)
+        self.kind = meta.get("kind", "query")
+        if self.kind not in KINDS:
+            raise ValueError(f"{path.name}: unknown kind {self.kind!r}")
+        self.run_as = meta.get("run_as") or None
+        self.setup_path = path / "setup.sql" if (path / "setup.sql").exists() else None
+        self.check_path = path / "check.sql"
         self.solution_path = path / "solution.sql"
         # Performance questions grade against the original (slow but correct) query.
         expected = path / "expected.sql"
@@ -83,6 +97,10 @@ class Question:
     @property
     def is_perf(self) -> bool:
         return self.target_ms is not None
+
+    @property
+    def is_lab(self) -> bool:
+        return self.kind != "query"
 
     def target_for_scale(self, scale: float) -> Optional[float]:
         if self.target_ms is None:
@@ -107,6 +125,12 @@ class Question:
             out.append("Tables: " + ", ".join(f"`{t}`" for t in self.tables) + "  ")
         if self.is_perf:
             out.append(f"⏱ **Performance target: {self.target_label()}**")
+        if self.kind == "script":
+            out.append(f"🧪 **Lab:** write a script. It runs as role `{self.run_as}` in a transaction "
+                       "that is rolled back after checking.")
+        elif self.kind == "state":
+            out.append("🧪 **Lab:** change the database however you like (the editor runs any statements), "
+                       "then check.")
         out.append("")
         out.append(self.prompt)
         return "\n".join(out)
@@ -200,14 +224,22 @@ def next_question(exclude=()) -> Optional[Question]:
     return None
 
 
+_STUB_HELP = {
+    "query": "-- Write ONE query below. Check it with ./dojo check {id} (Ctrl+T in the TUI).",
+    "script": "-- Write your script below (several statements are fine). It runs as role {run_as}\n"
+              "-- inside a transaction that is rolled back. Check it with ./dojo check {id} (Ctrl+T).",
+    "state": "-- Lab scratchpad. Ctrl+R (./dojo run {id}) runs everything here as the superuser,\n"
+             "-- statement by statement, with autocommit. Then check the result with Ctrl+T.",
+}
+
+
 def ensure_stub(q: Question) -> bool:
     """Create answers/NNN.sql if missing. Returns True if created."""
     if q.answer_path.exists():
         return False
     ANSWERS_DIR.mkdir(exist_ok=True)
     q.answer_path.write_text(
-        f"-- Q{q.code} · {q.title}\n"
-        f"-- Write ONE query below. Check it with ./dojo check {q.id} (or F6 in the TUI).\n\n",
+        f"-- Q{q.code} · {q.title}\n" + _STUB_HELP[q.kind].format(id=q.id, run_as=q.run_as) + "\n\n",
         encoding="utf-8")
     update_progress(q, lambda e: e.setdefault("started_at", now_iso()))
     return True
@@ -253,10 +285,18 @@ def _dollar_tag(text: str, i: int) -> Optional[str]:
 
 
 def strip_sql(sql: str) -> str:
-    """Remove comments and trailing semicolons; refuse multiple statements.
+    """Remove comments and trailing semicolons; refuse multiple statements."""
+    text = _strip_comments(sql)
+    while text.endswith(";"):
+        text = text[:-1].rstrip()
+    if _has_top_level_semicolon(text):
+        raise QueryError("Your answer must be a single query (found more than one statement).\n"
+                         "Run setup like CREATE INDEX in psql (./dojo psql), not in the answer file.")
+    return text
 
-    A tiny lexer that understands '...', "...", $tag$...$tag$, -- and /* */.
-    """
+
+def _strip_comments(sql: str) -> str:
+    """A tiny lexer that understands '...', "...", $tag$...$tag$, -- and /* */."""
     out, i, n = [], 0, len(sql)
     while i < n:
         ch = sql[i]
@@ -286,13 +326,47 @@ def strip_sql(sql: str) -> str:
         else:
             out.append(ch)
             i += 1
-    text = "".join(out).strip()
-    while text.endswith(";"):
-        text = text[:-1].rstrip()
-    if _has_top_level_semicolon(text):
-        raise QueryError("Your answer must be a single query (found more than one statement).\n"
-                         "Run setup like CREATE INDEX in psql (./dojo psql), not in the answer file.")
-    return text
+    return "".join(out).strip()
+
+
+def split_statements(sql: str) -> List[str]:
+    """Split a script into statements (comments removed)."""
+    text = _strip_comments(sql)
+    out, start, i, n = [], 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            i = _skip_quoted(text, i)
+        elif ch == "$" and _dollar_tag(text, i):
+            tag = _dollar_tag(text, i)
+            j = text.find(tag, i + len(tag))
+            i = n if j == -1 else j + len(tag)
+        elif ch == ";":
+            out.append(text[start:i].strip())
+            start = i = i + 1
+        else:
+            i += 1
+    out.append(text[start:].strip())
+    return [s for s in out if s]
+
+
+_FORBIDDEN_IN_SCRIPT = re.compile(
+    r"^(BEGIN|START|COMMIT|END|ABORT|ROLLBACK(?!\s+TO)|SET\s+(LOCAL\s+|SESSION\s+)?ROLE|RESET\s+(ROLE|ALL)"
+    r"|SET\s+(LOCAL\s+|SESSION\s+)?SESSION\s+AUTHORIZATION|RESET\s+SESSION)\b", re.I)
+
+
+def validate_script(sql: str) -> List[str]:
+    """Statements of a script-lab answer, refusing ones that would escape the sandbox."""
+    stmts = split_statements(sql)
+    if not stmts:
+        raise QueryError("no SQL found (the file only has comments)")
+    if re.search(r"(^|\n)\s*\\", _strip_comments(sql)):
+        raise QueryError("psql backslash commands aren't allowed in the script")
+    for st in stmts:
+        if _FORBIDDEN_IN_SCRIPT.match(st):
+            raise QueryError(f"Not allowed in a lab script: {st.split()[0].upper()} ... "
+                             "The checker runs your script inside its own transaction, as the lab's role.")
+    return stmts
 
 
 def _has_top_level_semicolon(text: str) -> bool:
@@ -397,6 +471,27 @@ def explain(sql: str, analyze: bool = True, timeout_s: int = DEFAULT_TIMEOUT_S) 
     if proc.returncode != 0:
         raise QueryError(_clean_error(proc))
     return proc.stdout.rstrip()
+
+
+def run_script(sql: str, timeout_s: int = DEFAULT_TIMEOUT_S) -> str:
+    """Run any statements (autocommit, as the superuser) and return psql's output as text."""
+    if not split_statements(sql):
+        raise QueryError("no SQL found (the file only has comments)")
+    script = (f"SET application_name = '{APP_NAME}';\nSET statement_timeout = '{timeout_s}s';\n"
+              f"\\set QUIET off\n\\timing on\n\\set ECHO queries\n{sql}\n")
+    cmd = psql_cmd() + ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-"]
+    try:
+        proc = subprocess.run(cmd, input=script, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, encoding="utf-8", timeout=timeout_s + 30)
+    except FileNotFoundError:
+        raise DojoError(f"could not run {cmd[0]!r}. Is Docker installed? (or set DOJO_PSQL)")
+    except subprocess.TimeoutExpired:
+        raise QueryError("timed out")
+    out = re.sub(r"^Timing is on\.\n", "", proc.stdout, flags=re.M)
+    out = re.sub(r"^psql:<stdin>:\d+: ", "", out, flags=re.M).rstrip()
+    if proc.returncode != 0:
+        raise QueryError(out or f"psql exited with code {proc.returncode}")
+    return out
 
 
 def cancel_queries() -> None:
@@ -593,6 +688,8 @@ class Grade:
     first_solve: bool = False
     attempts: int = 0
     hints: int = 0
+    checks: List[Tuple[str, bool, str]] = field(default_factory=list)  # labs
+    output: str = ""  # labs: what your script printed
 
     @property
     def passed(self) -> bool:
@@ -600,10 +697,20 @@ class Grade:
 
 
 def grade(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S,
-          on_status: Optional[Callable[[str], None]] = None) -> Grade:
-    """Run the answer, compare with the reference, update progress."""
+          on_status: Optional[Callable[[str], None]] = None, record: bool = True) -> Grade:
+    """Run the answer, compare with the reference, update progress (unless record=False)."""
     meta = require_db()
     g = Grade(target_ms=q.target_for_scale(float(meta.get("scale", 1))))
+    if q.is_lab:
+        try:
+            _grade_lab(q, sql, g, timeout_s, on_status)
+        except QueryError as e:
+            g.error = str(e)
+        if record:
+            _record_attempt(q, g)
+        return g
+    if q.setup_path is not None and not lab_is_set_up(q):
+        setup_lab(q)
     g.expected = reference_result(q, meta, on_status=on_status)
     runs = 3 if q.is_perf else 1
     try:
@@ -621,7 +728,12 @@ def grade(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S,
     except QueryError as e:
         g.error = str(e)
         g.correct = False
+    if record:
+        _record_attempt(q, g)
+    return g
 
+
+def _record_attempt(q: Question, g: Grade) -> None:
     def record(e: dict):
         e.setdefault("started_at", now_iso())
         e["attempts"] = e.get("attempts", 0) + 1
@@ -629,10 +741,87 @@ def grade(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S,
             if not e.get("solved_at"):
                 e["solved_at"] = now_iso()
                 g.first_solve = True
-            e["best_ms"] = round(min(g.best_ms, e.get("best_ms", g.best_ms)), 1)
+            if g.best_ms is not None:
+                e["best_ms"] = round(min(g.best_ms, e.get("best_ms", g.best_ms)), 1)
         g.attempts, g.hints = e["attempts"], e.get("hints", 0)
     update_progress(q, record)
-    return g
+
+
+# --------------------------------------------------------------------------- #
+# Labs
+# --------------------------------------------------------------------------- #
+_LABS_TABLE = "CREATE TABLE IF NOT EXISTS _dojo.labs (question_id int PRIMARY KEY, set_up_at timestamptz NOT NULL);"
+
+
+def lab_is_set_up(q: Question) -> bool:
+    if q.setup_path is None:
+        return True
+    try:
+        rows = query_rows(f"{_LABS_TABLE}\nSELECT 1 FROM _dojo.labs WHERE question_id = {q.id};")
+    except QueryError:
+        return False
+    return bool(rows)
+
+
+def setup_lab(q: Question) -> None:
+    """(Re)create the lab's objects. Idempotent; resets any work done in a state lab."""
+    if q.setup_path is None:
+        return
+    proc = psql(q.setup_path.read_text(encoding="utf-8") + f"\n{_LABS_TABLE}\n"
+                f"INSERT INTO _dojo.labs VALUES ({q.id}, now()) "
+                f"ON CONFLICT (question_id) DO UPDATE SET set_up_at = now();\n", timeout=600)
+    if proc.returncode != 0:
+        raise DojoError(f"setting up the lab failed:\n{_clean_error(proc)}")
+
+
+def _parse_checks(csv_text: str) -> List[Tuple[str, bool, str]]:
+    csv.field_size_limit(max(csv.field_size_limit(), 16 * 1024 * 1024))
+    rows = list(csv.reader(io.StringIO(csv_text.strip("\n"))))
+    if not rows or [c.lower() for c in rows[0][:2]] != ["check", "ok"]:
+        raise DojoError("check.sql must return columns (check, ok, detail)")
+    def detail(r):
+        d = r[2] if len(r) > 2 and r[2] != NULL else ""
+        return d if len(d) <= 200 else d[:197] + "..."
+    return [(r[0], r[1] == "t", detail(r)) for r in rows[1:]]
+
+
+_MARK = "__DOJO_CHECK__"
+
+
+def _grade_lab(q: Question, sql: str, g: "Grade", timeout_s: int,
+               on_status: Optional[Callable[[str], None]]) -> None:
+    check_sql = q.check_path.read_text(encoding="utf-8")
+    if q.kind == "script":
+        validate_script(sql)
+        if on_status:
+            on_status("Resetting the lab...")
+        setup_lab(q)
+        if on_status:
+            on_status(f"Running your script as {q.run_as or 'the superuser'}, then checking...")
+        script = (f"SET application_name = '{APP_NAME}';\nSET statement_timeout = '{timeout_s}s';\n"
+                  "\\pset null '" + NULL + "'\nBEGIN;\n"
+                  + (f"SET LOCAL ROLE {q.run_as};\n" if q.run_as else "")
+                  + f"{sql}\n;\nRESET ROLE;\n\\echo {_MARK}\n\\pset format csv\n{check_sql}\n;\nROLLBACK;\n")
+    else:
+        if not lab_is_set_up(q):
+            if on_status:
+                on_status("Setting up the lab...")
+            setup_lab(q)
+            g.error = ("The lab wasn't set up yet, so it has just been created for you. "
+                       "Do the task, then check again.")
+            return
+        if on_status:
+            on_status("Checking the database state...")
+        script = (f"SET application_name = '{APP_NAME}';\n\\pset null '{NULL}'\n"
+                  f"\\echo {_MARK}\n\\pset format csv\n{check_sql}\n")
+    proc = psql(script, timeout=timeout_s + 60)
+    if proc.returncode != 0:
+        g.error = _clean_error(proc)
+        return
+    before, _, after = proc.stdout.partition(_MARK + "\n")
+    g.output = before.strip("\n")
+    g.checks = _parse_checks(after)
+    g.correct = bool(g.checks) and all(ok for _, ok, _ in g.checks)
 
 
 # --------------------------------------------------------------------------- #

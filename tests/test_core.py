@@ -34,6 +34,19 @@ class StripSqlTest(unittest.TestCase):
         self.assertEqual(core.strip_sql("-- nothing here\n\n"), "")
 
 
+class ScriptTest(unittest.TestCase):
+    def test_split_statements(self):
+        self.assertEqual(core.split_statements("DELETE FROM t; -- c\nSELECT ';' ; /* x; */ SELECT $$a;b$$"),
+                         ["DELETE FROM t", "SELECT ';'", "SELECT $$a;b$$"])
+
+    def test_script_sandbox(self):
+        for bad in ["BEGIN", "COMMIT", "ROLLBACK", "SET ROLE dojo", "set local role x", "RESET ROLE",
+                    "SET SESSION AUTHORIZATION dojo", "\\c dojo"]:
+            with self.subTest(bad=bad), self.assertRaises(core.QueryError):
+                core.validate_script("SELECT 1;\n" + bad)
+        core.validate_script("SAVEPOINT a; DELETE FROM t; ROLLBACK TO a; SELECT setval('s', 1, false)")
+
+
 class NormalizeTest(unittest.TestCase):
     def test_numbers_compare_after_rounding(self):
         self.assertEqual(core.normalize("12.30", 2), core.normalize("12.3", 2))
@@ -97,9 +110,16 @@ class QuestionBankTest(unittest.TestCase):
                 self.assertTrue(q.solution_path.exists())
                 self.assertTrue(q.hints, "every question needs hints")
                 self.assertIn(q.level, core.LEVELS)
-                self.assertIn("Expected columns", q.prompt)
                 self.assertTrue(q.solution_path.read_text().startswith(f"-- Q{q.code} · {q.title}"),
                                 "solution.sql should start with '-- Qnnn · <title>'")
+                if q.is_lab:
+                    self.assertTrue(q.check_path.exists(), "labs need check.sql")
+                    self.assertIsNotNone(q.setup_path, "labs need setup.sql")
+                    if q.kind == "script":
+                        self.assertTrue(q.run_as, "script labs need run_as")
+                        core.validate_script(q.solution_path.read_text())
+                    continue
+                self.assertIn("Expected columns", q.prompt)
                 core.strip_sql(q.expected_path.read_text())  # single statement
                 if q.is_perf:
                     self.assertTrue((q.dir / "expected.sql").exists(), "perf questions grade against expected.sql")

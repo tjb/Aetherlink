@@ -42,6 +42,11 @@ def print_question(q: core.Question) -> None:
         print(dim("Tables: " + ", ".join(q.tables)))
     if q.is_perf:
         print(yellow(f"Performance target: {q.target_label()}"))
+    if q.kind == "script":
+        print(yellow(f"Lab: your answer is a script, run as role {q.run_as} in a transaction that is rolled back."))
+    elif q.kind == "state":
+        print(yellow(f"Lab: change the database (./dojo psql, or ./dojo run {q.id} runs your scratch file), "
+                     f"then check. Start over with ./dojo lab-reset {q.id}."))
     print()
     print(q.prompt)
     print()
@@ -184,6 +189,18 @@ def start_question(q: core.Question):
     print_question(q)
     if created:
         print(dim(f"Created answers/{q.code}.sql"))
+    if q.setup_path and core.db_meta() and not core.lab_is_set_up(q):
+        core.setup_lab(q)
+        print(dim("Lab objects created."))
+
+
+def cmd_lab_reset(args):
+    q = core.get_question(args.question)
+    if q.setup_path is None:
+        raise DojoError(f"Q{q.code} has no lab to reset")
+    core.require_db()
+    core.setup_lab(q)
+    print(green(f"Lab for Q{q.code} reset."))
 
 
 def cmd_show(args):
@@ -203,11 +220,12 @@ def cmd_hint(args):
 
 
 def cmd_run(args):
-    if args.target.isdigit():
-        sql = read_answer(core.get_question(args.target))
-    else:
-        sql = core.Path(args.target).read_text(encoding="utf-8")
+    q = core.get_question(args.target) if args.target.isdigit() else None
+    sql = read_answer(q) if q else core.Path(args.target).read_text(encoding="utf-8")
     core.require_db()
+    if (q and q.is_lab) or args.script:
+        print(core.run_script(sql, timeout_s=args.timeout))
+        return
     print_table(core.run_query(sql, timeout_s=args.timeout), args.limit)
 
 
@@ -216,13 +234,27 @@ _KIND_STYLE = {"error": red, "warn": yellow, "info": dim, "row": lambda s: "    
 
 def cmd_check(args):
     q = core.get_question(args.question)
-    sql = read_answer(q, args.file)
+    # state labs check the database itself; the answer file is only a scratchpad
+    sql = "" if q.kind == "state" and not args.file and not q.answer_path.exists() else read_answer(q, args.file)
     print(bold(cyan(f"Q{q.code} · {q.title}")))
     g = core.grade(q, sql, timeout_s=args.timeout, on_status=lambda s: print(dim("  " + s)))
     if g.error:
-        print(red("✘ Your query failed:"))
+        print(red({"query": "✘ Your query failed:", "script": "✘ Your script failed:"}.get(q.kind, "✘ Not checked:")))
         print("  " + g.error.replace("\n", "\n  "))
         sys.exit(1)
+    if q.is_lab:
+        if g.output:
+            print(dim("  your script printed:"))
+            print(dim("    " + "\n    ".join(g.output.splitlines()[:20])))
+        for name, ok, detail in g.checks:
+            print(f"  {green('✔') if ok else red('✘')} {name}" + (dim(f"  ({detail})") if detail else ""))
+        if g.passed:
+            print(green("✔ Lab complete!") + dim(f"  attempt {g.attempts}"))
+            if g.first_solve:
+                print(dim(f"  Read the explanation: ./dojo solution {q.id}"))
+        else:
+            print(red("✘ Not yet."))
+        sys.exit(0 if g.passed else 1)
     runs = f"  (best of {len(g.timings)})" if len(g.timings) > 1 else ""
     print(f"  yours      {len(g.actual.rows):>7} rows  {core.fmt_ms(g.best_ms):>10}" + dim(runs))
     print(dim(f"  reference  {len(g.expected.rows):>7} rows  {core.fmt_ms(g.expected.ms):>10}"))
@@ -256,6 +288,8 @@ def cmd_solution(args):
 
 def cmd_explain(args):
     q = core.get_question(args.question)
+    if q.is_lab:
+        raise DojoError("explain works on single queries. In a lab, put EXPLAIN in your script.")
     sql = read_answer(q, args.file)
     core.require_db()
     print(core.explain(sql, analyze=not args.no_analyze, timeout_s=args.timeout))
@@ -289,15 +323,20 @@ def cmd_selftest(args):
             problems.append("no hints")
         if not q.solution_path.exists():
             problems.append("missing solution.sql")
-        if q.ordered and not re.search(r"order\s+by", core.strip_sql(q.expected_path.read_text()), re.I):
-            problems.append("ordered: true but the reference has no ORDER BY")
         try:
-            res = core.reference_result(q, meta, refresh=True)
-            if not res.rows:
-                problems.append("reference returns no rows")
-            detail = f"{len(res.rows):>6} rows  {core.fmt_ms(res.ms):>10}"
+            if q.is_lab:
+                detail = selftest_lab(q)
+            else:
+                if q.ordered and not re.search(r"order\s+by", core.strip_sql(q.expected_path.read_text()), re.I):
+                    problems.append("ordered: true but the reference has no ORDER BY")
+                if q.setup_path:
+                    core.setup_lab(q)
+                res = core.reference_result(q, meta, refresh=True)
+                if not res.rows:
+                    problems.append("reference returns no rows")
+                detail = f"{len(res.rows):>6} rows  {core.fmt_ms(res.ms):>10}"
         except DojoError as e:
-            problems.append(str(e).splitlines()[-1])
+            problems.append(str(e).splitlines()[-1] if str(e).strip() else repr(e))
         if problems:
             failures += 1
             print(red(f"✘ {q.code} {q.title}: " + "; ".join(problems)))
@@ -306,6 +345,27 @@ def cmd_selftest(args):
     if failures:
         raise DojoError(f"{failures} question(s) failed the self-test")
     print(green("All reference queries OK."))
+
+
+def selftest_lab(q: core.Question) -> str:
+    """The reference solution must pass the checks, and doing nothing must not."""
+    solution = q.solution_path.read_text(encoding="utf-8")
+    core.setup_lab(q)
+    if q.kind == "state":
+        g = core.grade(q, "", record=False)
+        if g.passed:
+            raise DojoError("the checks pass before doing anything")
+        core.run_script(solution)
+    else:
+        g = core.grade(q, "SELECT 1", record=False)
+        if g.passed:
+            raise DojoError("the checks pass for a script that does nothing")
+    g = core.grade(q, solution, record=False)
+    core.setup_lab(q)  # leave a fresh lab behind
+    if not g.passed:
+        failed = [name for name, ok, _ in g.checks if not ok]
+        raise DojoError("the solution fails: " + (g.error or ", ".join(failed)))
+    return f"{len(g.checks):>3} checks pass"
 
 
 def cmd_issue(args):
@@ -374,6 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("target", help="question number or path to a .sql file")
     sp.add_argument("--limit", type=int, default=50)
     sp.add_argument("--timeout", type=int, default=core.DEFAULT_TIMEOUT_S)
+    sp.add_argument("--script", action="store_true", help="run a multi-statement script (psql output)")
     sp = add("check", cmd_check, "grade your answer")
     sp.add_argument("question")
     sp.add_argument("--file", help="answer file (default answers/NNN.sql)")
@@ -386,6 +447,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--file")
     sp.add_argument("--no-analyze", action="store_true", help="plan only, don't execute")
     sp.add_argument("--timeout", type=int, default=core.DEFAULT_TIMEOUT_S)
+    sp = add("lab-reset", cmd_lab_reset, "rebuild a lab's objects (Level 6)")
+    sp.add_argument("question")
     sp = add("reset", cmd_reset, "drop indexes/views/tables you created")
     sp.add_argument("-y", "--yes", action="store_true")
     sp = add("selftest", cmd_selftest, "run every reference query (for CI / question authors)")
