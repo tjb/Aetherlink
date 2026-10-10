@@ -1,0 +1,676 @@
+"""Shared logic for the SQL Dojo CLI and TUI. Standard library only (Python 3.8+)."""
+from __future__ import annotations
+
+import csv
+import datetime as dt
+import decimal
+import hashlib
+import io
+import json
+import os
+import re
+import shlex
+import subprocess
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+QUESTIONS_DIR = ROOT / "questions"
+ANSWERS_DIR = ROOT / "answers"
+PROGRESS_FILE = ANSWERS_DIR / "progress.json"
+CACHE_DIR = ROOT / ".dojo-cache"
+GENERATOR = ROOT / "db" / "generate.sql"
+COMPOSE = ["docker", "compose", "-f", str(ROOT / "docker-compose.yml")]
+
+LEVELS = {
+    1: "Foundations",
+    2: "Window functions",
+    3: "Analytics patterns",
+    4: "Advanced SQL",
+    5: "Performance",
+}
+DATASET_TABLES = ["users", "categories", "products", "product_prices", "orders",
+                  "order_items", "events", "reviews", "subscriptions"]
+NULL = "<NULL>"
+APP_NAME = "sql-dojo"
+DEFAULT_TIMEOUT_S = 300
+
+
+class DojoError(Exception):
+    """Something the user should be told about (no traceback)."""
+
+
+class QueryError(DojoError):
+    """A query failed: syntax error, timeout, missing table, ..."""
+
+
+# --------------------------------------------------------------------------- #
+# Questions
+# --------------------------------------------------------------------------- #
+class Question:
+    def __init__(self, path: Path):
+        self.dir = path
+        meta, body = _parse_front_matter((path / "question.md").read_text(encoding="utf-8"))
+        self.id = int(meta["id"])
+        self.title = meta["title"]
+        self.level = int(meta["level"])
+        self.topics = _split_list(meta.get("topics", ""))
+        self.tables = _split_list(meta.get("tables", ""))
+        self.ordered = meta.get("ordered", "false").lower() == "true"
+        self.decimals = int(meta.get("decimals", "2"))
+        self.target_ms = float(meta["target_ms"]) if "target_ms" in meta else None
+        self.target_scaling = meta.get("target_scaling", "constant")
+        self.prompt, self.hints = _split_hints(body)
+        self.solution_path = path / "solution.sql"
+        # Performance questions grade against the original (slow but correct) query.
+        expected = path / "expected.sql"
+        self.expected_path = expected if expected.exists() else self.solution_path
+
+    @property
+    def code(self) -> str:
+        return f"{self.id:03d}"
+
+    @property
+    def answer_path(self) -> Path:
+        return ANSWERS_DIR / f"{self.code}.sql"
+
+    @property
+    def level_name(self) -> str:
+        return LEVELS.get(self.level, f"Level {self.level}")
+
+    @property
+    def is_perf(self) -> bool:
+        return self.target_ms is not None
+
+    def target_for_scale(self, scale: float) -> Optional[float]:
+        if self.target_ms is None:
+            return None
+        if self.target_scaling == "linear":
+            return self.target_ms * max(1.0, scale)
+        return self.target_ms
+
+    def target_label(self) -> str:
+        if self.target_ms is None:
+            return ""
+        per = " × scale" if self.target_scaling == "linear" else ""
+        return f"{self.target_ms:g} ms{per}"
+
+    def markdown(self, heading: bool = True) -> str:
+        """The question as Markdown (used by the TUI and the daily GitHub issue)."""
+        out = []
+        if heading:
+            out.append(f"# Q{self.code} · {self.title}\n")
+        out.append(f"**Level {self.level} · {self.level_name}** · {', '.join(self.topics)}  ")
+        if self.tables:
+            out.append("Tables: " + ", ".join(f"`{t}`" for t in self.tables) + "  ")
+        if self.is_perf:
+            out.append(f"⏱ **Performance target: {self.target_label()}**")
+        out.append("")
+        out.append(self.prompt)
+        return "\n".join(out)
+
+
+def _split_list(s: str) -> List[str]:
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _parse_front_matter(text: str):
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("question.md must start with a '---' front matter block")
+    meta = {}
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            return meta, "\n".join(lines[i + 1:]).strip()
+        if line.strip():
+            key, _, value = line.partition(":")
+            meta[key.strip()] = value.strip()
+    raise ValueError("unterminated front matter")
+
+
+def _split_hints(body: str):
+    parts = re.split(r"^## Hints\s*$", body, maxsplit=1, flags=re.M)
+    prompt = parts[0].strip()
+    hints: List[str] = []
+    if len(parts) > 1:
+        for line in parts[1].splitlines():
+            if line.startswith("- "):
+                hints.append(line[2:].strip())
+            elif line.startswith("  ") and hints:
+                hints[-1] += " " + line.strip()
+    return prompt, hints
+
+
+def load_questions() -> List[Question]:
+    qs = [Question(d) for d in sorted(QUESTIONS_DIR.iterdir()) if (d / "question.md").exists()]
+    ids = [q.id for q in qs]
+    if len(ids) != len(set(ids)):
+        raise DojoError("duplicate question ids in questions/")
+    return sorted(qs, key=lambda q: q.id)
+
+
+def get_question(ref) -> Question:
+    try:
+        qid = int(ref)
+    except (TypeError, ValueError):
+        raise DojoError(f"'{ref}' is not a question number")
+    for q in load_questions():
+        if q.id == qid:
+            return q
+    raise DojoError(f"no question {qid}. See ./dojo list")
+
+
+# --------------------------------------------------------------------------- #
+# Progress: answers/progress.json is meant to be committed. It's your log.
+# --------------------------------------------------------------------------- #
+def load_progress() -> dict:
+    if PROGRESS_FILE.exists():
+        return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_progress(progress: dict) -> None:
+    ANSWERS_DIR.mkdir(exist_ok=True)
+    PROGRESS_FILE.write_text(json.dumps(progress, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def update_progress(q: Question, fn: Callable[[dict], None]) -> dict:
+    progress = load_progress()
+    entry = progress.setdefault(q.code, {})
+    fn(entry)
+    save_progress(progress)
+    return entry
+
+
+def now_iso() -> str:
+    return dt.datetime.now().replace(microsecond=0).isoformat()
+
+
+def is_solved(progress: dict, q: Question) -> bool:
+    return bool(progress.get(q.code, {}).get("solved_at"))
+
+
+def next_question(exclude=()) -> Optional[Question]:
+    progress = load_progress()
+    for q in load_questions():
+        if not is_solved(progress, q) and q.id not in exclude:
+            return q
+    return None
+
+
+def ensure_stub(q: Question) -> bool:
+    """Create answers/NNN.sql if missing. Returns True if created."""
+    if q.answer_path.exists():
+        return False
+    ANSWERS_DIR.mkdir(exist_ok=True)
+    q.answer_path.write_text(
+        f"-- Q{q.code} · {q.title}\n"
+        f"-- Write ONE query below. Check it with ./dojo check {q.id} (or F6 in the TUI).\n\n",
+        encoding="utf-8")
+    update_progress(q, lambda e: e.setdefault("started_at", now_iso()))
+    return True
+
+
+def reveal_hint(q: Question, all_hints: bool = False) -> List[str]:
+    """Reveal one more hint (or all) and return every hint revealed so far."""
+    def bump(e):
+        used = e.get("hints", 0)
+        e["hints"] = len(q.hints) if all_hints else min(len(q.hints), used + 1)
+    entry = update_progress(q, bump)
+    return q.hints[:entry["hints"]]
+
+
+def revealed_hints(q: Question) -> List[str]:
+    return q.hints[:load_progress().get(q.code, {}).get("hints", 0)]
+
+
+def mark_solution_viewed(q: Question) -> None:
+    if not is_solved(load_progress(), q):
+        update_progress(q, lambda e: e.__setitem__("revealed", True))
+
+
+# --------------------------------------------------------------------------- #
+# SQL text handling
+# --------------------------------------------------------------------------- #
+def _skip_quoted(text: str, i: int) -> int:
+    """Given text[i] is a quote char, return the index just past the closing quote."""
+    ch, j, n = text[i], i + 1, len(text)
+    while j < n:
+        if text[j] == ch:
+            if j + 1 < n and text[j + 1] == ch:
+                j += 2
+                continue
+            return j + 1
+        j += 1
+    return n
+
+
+def _dollar_tag(text: str, i: int) -> Optional[str]:
+    m = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$", text[i:])
+    return m.group(0) if m else None
+
+
+def strip_sql(sql: str) -> str:
+    """Remove comments and trailing semicolons; refuse multiple statements.
+
+    A tiny lexer that understands '...', "...", $tag$...$tag$, -- and /* */.
+    """
+    out, i, n = [], 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j == -1 else j
+        elif sql.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if sql.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            out.append(" ")
+        elif ch in ("'", '"'):
+            j = _skip_quoted(sql, i)
+            out.append(sql[i:j])
+            i = j
+        elif ch == "$" and _dollar_tag(sql, i):
+            tag = _dollar_tag(sql, i)
+            j = sql.find(tag, i + len(tag))
+            j = n if j == -1 else j + len(tag)
+            out.append(sql[i:j])
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    text = "".join(out).strip()
+    while text.endswith(";"):
+        text = text[:-1].rstrip()
+    if _has_top_level_semicolon(text):
+        raise QueryError("Your answer must be a single query (found more than one statement).\n"
+                         "Run setup like CREATE INDEX in psql (./dojo psql), not in the answer file.")
+    return text
+
+
+def _has_top_level_semicolon(text: str) -> bool:
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            i = _skip_quoted(text, i)
+        elif ch == "$" and _dollar_tag(text, i):
+            tag = _dollar_tag(text, i)
+            j = text.find(tag, i + len(tag))
+            i = n if j == -1 else j + len(tag)
+        elif ch == ";":
+            return True
+        else:
+            i += 1
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# Talking to Postgres (through psql, so there are no Python dependencies)
+# --------------------------------------------------------------------------- #
+@dataclass
+class Result:
+    header: List[str]
+    rows: List[List[str]]
+    ms: float
+
+    def to_json(self) -> dict:
+        return {"header": self.header, "rows": self.rows, "ms": self.ms}
+
+    @classmethod
+    def from_json(cls, d: dict) -> "Result":
+        return cls(d["header"], [list(r) for r in d["rows"]], d["ms"])
+
+
+def using_custom_psql() -> bool:
+    return bool(os.environ.get("DOJO_PSQL"))
+
+
+def psql_cmd(interactive: bool = False) -> List[str]:
+    custom = os.environ.get("DOJO_PSQL")
+    if custom:
+        return shlex.split(custom)
+    cmd = COMPOSE + ["exec"]
+    if not interactive:
+        cmd.append("-T")
+    return cmd + ["db", "psql", "-U", "dojo", "-d", "dojo"]
+
+
+def psql(script: str, extra_args=(), timeout=None) -> subprocess.CompletedProcess:
+    cmd = psql_cmd() + ["-X", "-q", "-v", "ON_ERROR_STOP=1", *extra_args, "-f", "-"]
+    try:
+        return subprocess.run(cmd, input=script, capture_output=True, text=True,
+                              timeout=timeout, encoding="utf-8")
+    except FileNotFoundError:
+        raise DojoError(f"could not run {cmd[0]!r}. Is Docker installed? (or set DOJO_PSQL)")
+    except subprocess.TimeoutExpired:
+        raise QueryError("timed out")
+
+
+_TIME_RE = re.compile(r"^Time: ([\d.]+) ms.*$", re.M)
+
+
+def _clean_error(proc: subprocess.CompletedProcess) -> str:
+    err = (proc.stderr or proc.stdout or "").strip()
+    return re.sub(r"^psql:<stdin>:\d+: ", "", err, flags=re.M) or f"psql exited with code {proc.returncode}"
+
+
+def run_query(sql: str, timeout_s: int = DEFAULT_TIMEOUT_S) -> Result:
+    body = strip_sql(sql)
+    if not body:
+        raise QueryError("no SQL found (the file only has comments)")
+    script = (f"SET application_name = '{APP_NAME}';\n"
+              f"SET statement_timeout = '{timeout_s}s';\n"
+              f"\\pset null '{NULL}'\n"
+              f"\\timing on\n{body}\n;\n")
+    proc = psql(script, extra_args=["--csv"], timeout=timeout_s + 30)
+    if proc.returncode != 0:
+        err = _clean_error(proc)
+        if "statement timeout" in err:
+            err += f"\n(the query ran for more than {timeout_s}s)"
+        elif "canceling statement due to user request" in err:
+            err = "Cancelled."
+        raise QueryError(err)
+    out = proc.stdout
+    times = [float(t) for t in _TIME_RE.findall(out)]
+    rows = list(csv.reader(io.StringIO(_TIME_RE.sub("", out).strip("\n"))))
+    if not rows:
+        raise QueryError("the statement returned no result set (is it a SELECT?)")
+    return Result(rows[0], rows[1:], times[-1] if times else 0.0)
+
+
+def explain(sql: str, analyze: bool = True, timeout_s: int = DEFAULT_TIMEOUT_S) -> str:
+    body = strip_sql(sql)
+    if not body:
+        raise QueryError("no SQL found (the file only has comments)")
+    opts = "ANALYZE, BUFFERS" if analyze else "COSTS"
+    proc = psql(f"SET application_name = '{APP_NAME}';\n"
+                f"SET statement_timeout = '{timeout_s}s';\n"
+                f"EXPLAIN ({opts}) {body};\n", timeout=timeout_s + 30)
+    if proc.returncode != 0:
+        raise QueryError(_clean_error(proc))
+    return proc.stdout.rstrip()
+
+
+def cancel_queries() -> None:
+    """Cancel any running dojo query (used by the TUI's Esc key)."""
+    psql(f"SELECT pg_cancel_backend(pid) FROM pg_stat_activity "
+         f"WHERE application_name = '{APP_NAME}' AND pid <> pg_backend_pid();", timeout=15)
+
+
+def db_meta() -> Dict[str, str]:
+    """{} when the database is down or not generated yet."""
+    try:
+        proc = psql("SELECT key, value FROM _dojo.meta;", extra_args=["--csv", "-t"], timeout=20)
+    except DojoError:
+        return {}
+    if proc.returncode != 0:
+        return {}
+    return dict(r for r in csv.reader(io.StringIO(proc.stdout)) if len(r) == 2)
+
+
+def require_db() -> Dict[str, str]:
+    meta = db_meta()
+    if not meta:
+        raise DojoError("the database is not running or has no data yet. Run: ./dojo up")
+    return meta
+
+
+def query_rows(sql: str) -> List[List[str]]:
+    proc = psql(sql, extra_args=["--csv", "-t"], timeout=60)
+    if proc.returncode != 0:
+        raise QueryError(_clean_error(proc))
+    return [r for r in csv.reader(io.StringIO(proc.stdout)) if r]
+
+
+def schema() -> List[Tuple[str, str, str]]:
+    """(table, column, type) for the dataset tables plus anything you created in public."""
+    return [tuple(r) for r in query_rows("""
+        SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod)
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'm', 'v')
+          AND c.relname NOT LIKE 'pg\\_stat\\_statements%'
+        ORDER BY c.relname, a.attnum;""")]
+
+
+def table_stats() -> List[Tuple[str, str, str]]:
+    """(table, approx rows, size)."""
+    return [tuple(r) for r in query_rows("""
+        SELECT c.relname,
+               CASE WHEN c.reltuples < 0 THEN '?' ELSE to_char(c.reltuples, 'FM999,999,999,990') END,
+               pg_size_pretty(pg_total_relation_size(c.oid))
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'm')
+        ORDER BY pg_total_relation_size(c.oid) DESC;""")]
+
+
+# --------------------------------------------------------------------------- #
+# Database lifecycle
+# --------------------------------------------------------------------------- #
+def docker_ok() -> bool:
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=20).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def compose_up_cmd() -> List[str]:
+    return COMPOSE + ["up", "-d", "--wait"]
+
+
+def generate_cmd(scale: float) -> List[str]:
+    return psql_cmd() + ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-v", f"scale={scale:g}", "-f", "-"]
+
+
+def stream(cmd: List[str], on_line: Callable[[str], None], stdin_path: Optional[Path] = None) -> int:
+    """Run a command, feeding each output line to on_line. Returns the exit code."""
+    stdin = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(cmd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        raise DojoError(f"could not run {cmd[0]!r}. Is Docker installed?")
+    finally:
+        if stdin_path:
+            stdin.close()
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        on_line(line.rstrip("\n"))
+    return proc.wait()
+
+
+def start_database(on_line: Callable[[str], None]) -> None:
+    if using_custom_psql():
+        return
+    if not docker_ok():
+        raise DojoError("Docker is not running. Start Docker Desktop (or the docker daemon) and try again.")
+    if stream(compose_up_cmd(), on_line) != 0:
+        raise DojoError("docker compose up failed (see the output above)")
+
+
+def generate_data(scale: float, on_line: Callable[[str], None]) -> None:
+    if scale <= 0:
+        raise DojoError("scale must be positive")
+    if stream(generate_cmd(scale), on_line, stdin_path=GENERATOR) != 0:
+        raise DojoError("generation failed (see the output above)")
+
+
+# --------------------------------------------------------------------------- #
+# Grading
+# --------------------------------------------------------------------------- #
+_NUM_RE = re.compile(r"^-?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$")
+
+
+def normalize(value: str, decimals: int):
+    if value == NULL:
+        return None
+    if _NUM_RE.match(value):
+        d = decimal.Decimal(value).quantize(decimal.Decimal(1).scaleb(-decimals),
+                                            rounding=decimal.ROUND_HALF_UP)
+        if d == 0:
+            d = abs(d)
+        return format(d.normalize(), "f")
+    return value
+
+
+def fmt_row(row) -> str:
+    return "(" + ", ".join("NULL" if v is None else v for v in row) + ")"
+
+
+def compare(expected: Result, actual: Result, q: Question) -> Tuple[bool, List[Tuple[str, str]]]:
+    """Compare result sets. Returns (ok, [(kind, message)]), kind in info|warn|error."""
+    msgs: List[Tuple[str, str]] = []
+    if len(expected.header) != len(actual.header):
+        return False, [("error", f"Expected {len(expected.header)} columns ({', '.join(expected.header)}), "
+                                 f"got {len(actual.header)} ({', '.join(actual.header)}).")]
+    exp = [tuple(normalize(v, q.decimals) for v in r) for r in expected.rows]
+    act = [tuple(normalize(v, q.decimals) for v in r) for r in actual.rows]
+    if any(a != b for a, b in zip(expected.header, actual.header)):
+        msgs.append(("info", f"Column names differ from the spec ({', '.join(expected.header)}). "
+                             "That's fine: only values are checked."))
+    if q.ordered and exp == act:
+        return True, msgs
+    if Counter(exp) == Counter(act):
+        if not q.ordered:
+            return True, msgs
+        msgs.append(("error", "Exactly the right rows, but in the wrong order. "
+                              "Check your ORDER BY, including tie-breakers."))
+        return False, msgs
+    if len(exp) != len(act):
+        msgs.append(("error", f"Expected {len(exp)} rows, got {len(act)}."))
+    missing = Counter(exp) - Counter(act)
+    extra = Counter(act) - Counter(exp)
+    if missing:
+        msgs.append(("error", f"{sum(missing.values())} expected row(s) are missing, e.g.:"))
+        msgs.extend(("row", fmt_row(r)) for r in list(missing.elements())[:5])
+    if extra:
+        msgs.append(("error", f"{sum(extra.values())} row(s) should not be there, e.g.:"))
+        msgs.extend(("row", fmt_row(r)) for r in list(extra.elements())[:5])
+    return False, msgs
+
+
+def reference_result(q: Question, meta: dict, refresh: bool = False,
+                     on_status: Optional[Callable[[str], None]] = None) -> Result:
+    sql = q.expected_path.read_text(encoding="utf-8")
+    key = hashlib.sha256("|".join([sql, meta.get("scale", ""), meta.get("generated_at", "")])
+                         .encode()).hexdigest()[:16]
+    path = CACHE_DIR / f"{q.code}-{key}.json"
+    if path.exists() and not refresh:
+        return Result.from_json(json.loads(path.read_text(encoding="utf-8")))
+    if on_status:
+        on_status("Computing the reference answer (cached after the first run)...")
+    try:
+        res = run_query(sql, timeout_s=3600)
+    except QueryError as e:
+        raise DojoError(f"the reference solution failed (please report this):\n{e}")
+    CACHE_DIR.mkdir(exist_ok=True)
+    for old in CACHE_DIR.glob(f"{q.code}-*.json"):
+        old.unlink()
+    path.write_text(json.dumps(res.to_json()), encoding="utf-8")
+    return res
+
+
+@dataclass
+class Grade:
+    correct: bool = False
+    fast_enough: bool = True
+    error: Optional[str] = None
+    messages: List[Tuple[str, str]] = field(default_factory=list)
+    expected: Optional[Result] = None
+    actual: Optional[Result] = None
+    best_ms: Optional[float] = None
+    timings: List[float] = field(default_factory=list)
+    target_ms: Optional[float] = None
+    first_solve: bool = False
+    attempts: int = 0
+    hints: int = 0
+
+    @property
+    def passed(self) -> bool:
+        return self.correct and self.fast_enough
+
+
+def grade(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S,
+          on_status: Optional[Callable[[str], None]] = None) -> Grade:
+    """Run the answer, compare with the reference, update progress."""
+    meta = require_db()
+    g = Grade(target_ms=q.target_for_scale(float(meta.get("scale", 1))))
+    g.expected = reference_result(q, meta, on_status=on_status)
+    runs = 3 if q.is_perf else 1
+    try:
+        for i in range(runs):
+            if on_status:
+                on_status("Running your query" + (f" ({i + 1}/{runs})" if runs > 1 else "") + "...")
+            g.actual = run_query(sql, timeout_s=timeout_s)
+            g.timings.append(g.actual.ms)
+            if i == 0:
+                g.correct, g.messages = compare(g.expected, g.actual, q)
+                if not g.correct or (g.target_ms and g.actual.ms > 5 * g.target_ms):
+                    break  # wrong, or hopelessly slow: no point in re-running
+        g.best_ms = min(g.timings)
+        g.fast_enough = g.target_ms is None or g.best_ms <= g.target_ms
+    except QueryError as e:
+        g.error = str(e)
+        g.correct = False
+
+    def record(e: dict):
+        e.setdefault("started_at", now_iso())
+        e["attempts"] = e.get("attempts", 0) + 1
+        if g.passed:
+            if not e.get("solved_at"):
+                e["solved_at"] = now_iso()
+                g.first_solve = True
+            e["best_ms"] = round(min(g.best_ms, e.get("best_ms", g.best_ms)), 1)
+        g.attempts, g.hints = e["attempts"], e.get("hints", 0)
+    update_progress(q, record)
+    return g
+
+
+# --------------------------------------------------------------------------- #
+# Objects you created (indexes, views, ...) and resetting them
+# --------------------------------------------------------------------------- #
+def user_objects() -> List[Tuple[str, str, str]]:
+    """(kind, name, drop statement) for everything beyond the baseline dataset."""
+    tables = "ARRAY['" + "','".join(DATASET_TABLES) + "']"
+    try:
+        return [tuple(r) for r in query_rows(f"""
+            SELECT 'index', indexname, format('DROP INDEX IF EXISTS public.%I', indexname)
+            FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = ANY ({tables})
+              AND indexname NOT IN (SELECT name FROM _dojo.baseline_objects)
+            UNION ALL
+            SELECT 'statistics', stxname, format('DROP STATISTICS IF EXISTS public.%I', stxname)
+            FROM pg_statistic_ext s JOIN pg_namespace n ON n.oid = s.stxnamespace
+            WHERE n.nspname = 'public'
+            UNION ALL
+            SELECT 'materialized view', matviewname,
+                   format('DROP MATERIALIZED VIEW IF EXISTS public.%I CASCADE', matviewname)
+            FROM pg_matviews WHERE schemaname = 'public'
+            UNION ALL
+            SELECT 'view', viewname, format('DROP VIEW IF EXISTS public.%I CASCADE', viewname)
+            FROM pg_views WHERE schemaname = 'public' AND viewname NOT LIKE 'pg_stat_statements%'
+            UNION ALL
+            SELECT 'table', tablename, format('DROP TABLE IF EXISTS public.%I CASCADE', tablename)
+            FROM pg_tables WHERE schemaname = 'public' AND tablename <> ALL ({tables});""")
+            if len(r) == 3]
+    except QueryError:
+        return []
+
+
+def reset_objects(objs: List[Tuple[str, str, str]]) -> None:
+    proc = psql("\n".join(stmt + ";" for _, _, stmt in objs) + "\nANALYZE;\n")
+    if proc.returncode != 0:
+        raise DojoError(_clean_error(proc))
+
+
+def fmt_ms(ms: float) -> str:
+    return f"{ms:.1f} ms" if ms < 1000 else f"{ms / 1000:.2f} s"

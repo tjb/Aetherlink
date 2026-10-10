@@ -1,0 +1,31 @@
+name: Close solved questions
+
+# When you push answers/progress.json, close the daily issues of the questions you've solved.
+on:
+  push:
+    branches: [main]
+    paths: [answers/progress.json]
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  close:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Close issues for solved questions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          solved=$(python3 -c "import json; p = json.load(open('answers/progress.json')); print(' '.join(k for k, v in p.items() if v.get('solved_at')))")
+          gh issue list --label sql-dojo --state open --limit 1000 --json number,title \
+            --jq '.[] | "\(.number) \(.title)"' |
+          while read -r number title; do
+            code=$(echo "$title" | sed -nE 's/^\[Q([0-9]+)\].*/\1/p')
+            if [ -n "$code" ] && echo " $solved " | grep -q " $code "; then
+              gh issue close "$number" --reason completed --comment "Solved ✔ Nice work."
+            fi
+          done

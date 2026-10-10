@@ -1,0 +1,40 @@
+name: Daily SQL question
+
+# Opens one issue per day with the next question you haven't solved or been sent yet.
+# GitHub emails you about it (you're @mentioned), Interview Cake style.
+# Change the time below (UTC) to whenever you like your question.
+on:
+  schedule:
+    - cron: "47 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  ask:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pick the next question
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create sql-dojo --color 5319e7 --description "Daily SQL Dojo question" 2>/dev/null || true
+          posted=$(gh issue list --label sql-dojo --state all --limit 1000 --json title --jq '.[].title' \
+                   | sed -nE 's/^\[Q0*([0-9]+)\].*/\1/p' | tr '\n' ' ')
+          id=$(python3 dojo today --id-only --exclude "$posted")
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          if [ -z "$id" ]; then echo "Nothing left to send. Add more questions!"; fi
+      - name: Open the issue
+        if: steps.pick.outputs.id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QID: ${{ steps.pick.outputs.id }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 dojo issue "$QID" > body.md
+          printf '\n\n@%s, here is today'"'"'s question.\n' "$OWNER" >> body.md
+          gh issue create --title "$(python3 dojo title "$QID")" --label sql-dojo --body-file body.md

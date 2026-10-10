@@ -1,0 +1,11 @@
+# Local tooling
+.venv/
+.dojo-cache/
+__pycache__/
+*.pyc
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store

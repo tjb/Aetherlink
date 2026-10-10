@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""SQL Dojo launcher.
+
+  ./dojo             open the terminal IDE (installs Textual into ./.venv on first run)
+  ./dojo <command>   plain CLI, standard library only (./dojo help)
+"""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+
+def _reexec(python: Path, stage: str) -> None:
+    os.environ["DOJO_BOOTSTRAP"] = stage
+    os.execv(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+def launch_tui() -> None:
+    try:
+        import textual  # noqa: F401
+    except ImportError:
+        stage = os.environ.get("DOJO_BOOTSTRAP", "")
+        venv = ROOT / ".venv"
+        python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if stage == "installed":
+            sys.exit("Textual is still missing after installing it into .venv. "
+                     "Delete .venv and retry, or use the plain CLI: ./dojo help")
+        if python.exists() and stage == "":
+            _reexec(python, "venv")  # probably installed there already
+        try:
+            if not python.exists():
+                print("First run: creating .venv for the terminal UI...")
+                subprocess.check_call([sys.executable, "-m", "venv", str(venv)])
+            print("Installing Textual into .venv (one time)...")
+            subprocess.check_call([str(python), "-m", "pip", "install", "--quiet",
+                                   "--disable-pip-version-check", "-r", str(ROOT / "requirements.txt")])
+        except (subprocess.CalledProcessError, OSError) as e:
+            sys.exit(f"Could not set up the terminal UI ({e}).\n"
+                     "On Debian/Ubuntu you may need: sudo apt install python3-venv\n"
+                     "Everything also works from the plain CLI: ./dojo help")
+        _reexec(python, "installed")
+    from sqldojo.tui import run
+    run()
+
+
+if __name__ == "__main__":
+    if not sys.argv[1:] or sys.argv[1] == "tui":
+        launch_tui()
+    else:
+        from sqldojo.cli import main
+        main(sys.argv[1:])
