@@ -48,7 +48,8 @@ WHERE gcd(m, :n_products) = 1
 DROP TABLE IF EXISTS events, reviews, order_items, orders, subscriptions,
                      product_prices, products, categories, users CASCADE;
 DROP SCHEMA IF EXISTS _dojo CASCADE;
-DROP SCHEMA IF EXISTS lab CASCADE;  -- Level 6 labs are rebuilt on demand
+-- lab schemas (Levels 6+) are rebuilt on demand from the new data
+DROP SCHEMA IF EXISTS lab, partner, dq, mart, supplier, crm, stream, archive CASCADE;
 CREATE SCHEMA _dojo;
 
 -- Uniform [0,1) "random" number derived from a key and a salt.
@@ -468,7 +469,13 @@ COMMIT;
 -- -----------------------------------------------------------------------------
 -- 6. Events: the big one. Clickstream reconstructed from the hidden sessions.
 -- -----------------------------------------------------------------------------
-\echo '--> events (the big one, this takes a while)'
+\echo '--> events (the big one, a quarter at a time)'
+-- Built one quarter at a time: each chunk sorts only its own rows, so the temporary disk space
+-- needed stays small even at large scales. Event ids continue across chunks, so the result is
+-- identical to one big INSERT ... ORDER BY occurred_at.
+CREATE INDEX ON _dojo.stg_sessions (started_at);
+CREATE UNLOGGED TABLE _dojo.gen_state AS SELECT 0::bigint AS next_id;
+
 BEGIN;
 CREATE TABLE events (
   event_id    bigint NOT NULL,
@@ -480,68 +487,90 @@ CREATE TABLE events (
   properties  jsonb
 );
 
-INSERT INTO events
-SELECT row_number() OVER (ORDER BY occurred_at, sid, i, dup) AS event_id,
-       occurred_at, user_id, device, event_type, product_id, properties
-FROM (
-  SELECT e.*,
-         CASE
-           WHEN event_type = 'page_view' AND i = 1 THEN jsonb_build_object('path', '/', 'referrer',
-             CASE WHEN r < 0.35 THEN 'google' WHEN r < 0.60 THEN 'direct' WHEN r < 0.70 THEN 'instagram'
-                  WHEN r < 0.78 THEN 'tiktok' WHEN r < 0.85 THEN 'newsletter' WHEN r < 0.90 THEN 'bing'
-                  WHEN r < 0.95 THEN 'partner_blog' ELSE 'facebook' END)
-           WHEN event_type = 'page_view' THEN jsonb_build_object('path',
-             _dojo.pick(ARRAY['/deals','/new','/account','/help','/wishlist','/category'], sid * 64 + i, 45))
-           WHEN event_type = 'search' THEN jsonb_build_object('query',
-             CASE WHEN r < 0.15 THEN 'cheap ' WHEN r < 0.25 THEN 'best ' ELSE '' END ||
-             _dojo.pick(ARRAY['headphones','laptop','monitor','keyboard','phone case','charger','camera','lens',
-                             'coffee','knife set','office chair','desk','lamp','rug','shirt','running shoes',
-                             'jacket','dress','handbag','watch','sunglasses','yoga mat','dumbbells','tent',
-                             'sleeping bag','bike','helmet','sci-fi books','mystery novel','sql book',
-                             'board games','puzzle','video games','Headphones','LAPTOP','earbuds '], sid * 64 + i, 46))
-           WHEN event_type = 'product_view' THEN jsonb_build_object('source',
-             CASE WHEN r < 0.45 THEN 'search' WHEN r < 0.75 THEN 'category' WHEN r < 0.95 THEN 'recommendation' ELSE 'email' END)
-           WHEN event_type = 'add_to_cart' THEN jsonb_build_object('quantity', _dojo.qty(sid, i - n_browse))
-           WHEN event_type = 'checkout_started' THEN jsonb_build_object('items', k_cart)
-           WHEN event_type = 'purchase' THEN jsonb_build_object('order_id', order_id)
-         END AS properties
+CREATE FUNCTION _dojo.gen_events(lo timestamptz, hi timestamptz, np int, pm int) RETURNS text
+LANGUAGE plpgsql AS $gen$
+DECLARE
+  off bigint;
+  n   bigint;
+BEGIN
+  SELECT next_id INTO off FROM _dojo.gen_state;
+  INSERT INTO events
+  SELECT off + row_number() OVER (ORDER BY occurred_at, sid, i, dup) AS event_id,
+         occurred_at, user_id, device, event_type, product_id, properties
   FROM (
-    SELECT s.sid, i, dup, s.n_browse, s.k_cart, o.order_id,
-           s.started_at + _dojo.evt_offset(s.sid, i, s.pace) AS occurred_at,
-           CASE WHEN s.logged_in THEN s.user_id END AS user_id,
-           s.device,
-           _dojo.rnd(s.sid * 64 + i, 44) AS r,
+    SELECT e.*,
            CASE
-             WHEN i = 1 THEN 'page_view'
-             WHEN i <= s.n_browse AND s.depth >= 1 AND i <= s.k_cart + 1 THEN 'product_view'
-             WHEN i <= s.n_browse THEN
-               CASE WHEN s.depth = 0 THEN CASE WHEN _dojo.rnd(s.sid * 64 + i, 42) < 0.7 THEN 'page_view' ELSE 'search' END
-                    WHEN _dojo.rnd(s.sid * 64 + i, 42) < 0.5 THEN 'product_view'
-                    WHEN _dojo.rnd(s.sid * 64 + i, 42) < 0.8 THEN 'page_view' ELSE 'search' END
-             WHEN s.depth >= 2 AND i <= s.n_browse + s.k_cart THEN 'add_to_cart'
-             WHEN s.depth >= 3 AND i = s.n_browse + s.k_cart + 1 THEN 'checkout_started'
-             ELSE 'purchase'
-           END AS event_type,
-           CASE
-             WHEN i = 1 THEN NULL
-             WHEN i <= s.n_browse AND s.depth >= 1 AND i <= s.k_cart + 1 THEN _dojo.cart_pid(s.sid, i - 1, s.rank1, :n_products, :pid_mult)
-             WHEN i <= s.n_browse THEN
-               CASE WHEN s.depth >= 1 AND _dojo.rnd(s.sid * 64 + i, 42) < 0.5
-                    THEN _dojo.pid(_dojo.skewed_rank(s.sid * 64 + i, 43, :n_products), :n_products, :pid_mult) END
-             WHEN s.depth >= 2 AND i <= s.n_browse + s.k_cart THEN _dojo.cart_pid(s.sid, i - s.n_browse, s.rank1, :n_products, :pid_mult)
-           END AS product_id
-    FROM _dojo.stg_sessions s
-    CROSS JOIN LATERAL generate_series(1, s.n_total) i
-    -- at-least-once delivery: a small share of events arrive twice
-    CROSS JOIN LATERAL generate_series(1, CASE WHEN _dojo.rnd(s.sid * 64 + i, 41) < 0.004 THEN 2 ELSE 1 END) dup
-    LEFT JOIN _dojo.stg_orders o ON o.sid = s.sid AND i = s.n_total AND s.depth = 4
-    OFFSET 0  -- optimisation fence: compute event_type once instead of once per reference
-  ) e
-  WHERE occurred_at < timestamptz '2026-01-01'
-    -- purchases only exist if the order exists, and ad blockers eat ~3% of them
-    AND NOT (event_type = 'purchase' AND (order_id IS NULL OR _dojo.rnd(sid, 50) < 0.03))
-) ev
-ORDER BY occurred_at, sid, i, dup;
+             WHEN event_type = 'page_view' AND i = 1 THEN jsonb_build_object('path', '/', 'referrer',
+               CASE WHEN r < 0.35 THEN 'google' WHEN r < 0.60 THEN 'direct' WHEN r < 0.70 THEN 'instagram'
+                    WHEN r < 0.78 THEN 'tiktok' WHEN r < 0.85 THEN 'newsletter' WHEN r < 0.90 THEN 'bing'
+                    WHEN r < 0.95 THEN 'partner_blog' ELSE 'facebook' END)
+             WHEN event_type = 'page_view' THEN jsonb_build_object('path',
+               _dojo.pick(ARRAY['/deals','/new','/account','/help','/wishlist','/category'], sid * 64 + i, 45))
+             WHEN event_type = 'search' THEN jsonb_build_object('query',
+               CASE WHEN r < 0.15 THEN 'cheap ' WHEN r < 0.25 THEN 'best ' ELSE '' END ||
+               _dojo.pick(ARRAY['headphones','laptop','monitor','keyboard','phone case','charger','camera','lens',
+                               'coffee','knife set','office chair','desk','lamp','rug','shirt','running shoes',
+                               'jacket','dress','handbag','watch','sunglasses','yoga mat','dumbbells','tent',
+                               'sleeping bag','bike','helmet','sci-fi books','mystery novel','sql book',
+                               'board games','puzzle','video games','Headphones','LAPTOP','earbuds '], sid * 64 + i, 46))
+             WHEN event_type = 'product_view' THEN jsonb_build_object('source',
+               CASE WHEN r < 0.45 THEN 'search' WHEN r < 0.75 THEN 'category' WHEN r < 0.95 THEN 'recommendation' ELSE 'email' END)
+             WHEN event_type = 'add_to_cart' THEN jsonb_build_object('quantity', _dojo.qty(sid, i - n_browse))
+             WHEN event_type = 'checkout_started' THEN jsonb_build_object('items', k_cart)
+             WHEN event_type = 'purchase' THEN jsonb_build_object('order_id', order_id)
+           END AS properties
+    FROM (
+      SELECT s.sid, i, dup, s.n_browse, s.k_cart, o.order_id,
+             s.started_at + _dojo.evt_offset(s.sid, i, s.pace) AS occurred_at,
+             CASE WHEN s.logged_in THEN s.user_id END AS user_id,
+             s.device,
+             _dojo.rnd(s.sid * 64 + i, 44) AS r,
+             CASE
+               WHEN i = 1 THEN 'page_view'
+               WHEN i <= s.n_browse AND s.depth >= 1 AND i <= s.k_cart + 1 THEN 'product_view'
+               WHEN i <= s.n_browse THEN
+                 CASE WHEN s.depth = 0 THEN CASE WHEN _dojo.rnd(s.sid * 64 + i, 42) < 0.7 THEN 'page_view' ELSE 'search' END
+                      WHEN _dojo.rnd(s.sid * 64 + i, 42) < 0.5 THEN 'product_view'
+                      WHEN _dojo.rnd(s.sid * 64 + i, 42) < 0.8 THEN 'page_view' ELSE 'search' END
+               WHEN s.depth >= 2 AND i <= s.n_browse + s.k_cart THEN 'add_to_cart'
+               WHEN s.depth >= 3 AND i = s.n_browse + s.k_cart + 1 THEN 'checkout_started'
+               ELSE 'purchase'
+             END AS event_type,
+             CASE
+               WHEN i = 1 THEN NULL
+               WHEN i <= s.n_browse AND s.depth >= 1 AND i <= s.k_cart + 1 THEN _dojo.cart_pid(s.sid, i - 1, s.rank1, np, pm)
+               WHEN i <= s.n_browse THEN
+                 CASE WHEN s.depth >= 1 AND _dojo.rnd(s.sid * 64 + i, 42) < 0.5
+                      THEN _dojo.pid(_dojo.skewed_rank(s.sid * 64 + i, 43, np), np, pm) END
+               WHEN s.depth >= 2 AND i <= s.n_browse + s.k_cart THEN _dojo.cart_pid(s.sid, i - s.n_browse, s.rank1, np, pm)
+             END AS product_id
+      FROM _dojo.stg_sessions s
+      CROSS JOIN LATERAL generate_series(1, s.n_total) i
+      -- at-least-once delivery: a small share of events arrive twice
+      CROSS JOIN LATERAL generate_series(1, CASE WHEN _dojo.rnd(s.sid * 64 + i, 41) < 0.004 THEN 2 ELSE 1 END) dup
+      LEFT JOIN _dojo.stg_orders o ON o.sid = s.sid AND i = s.n_total AND s.depth = 4
+      -- only sessions that can have events in [lo, hi); a session lasts well under 6 hours
+      WHERE s.started_at >= lo - interval '6 hours' AND s.started_at < hi
+      OFFSET 0  -- optimisation fence: compute event_type once instead of once per reference
+    ) e
+    WHERE occurred_at >= lo AND occurred_at < hi
+      -- purchases only exist if the order exists, and ad blockers eat ~3% of them
+      AND NOT (event_type = 'purchase' AND (order_id IS NULL OR _dojo.rnd(sid, 50) < 0.03))
+  ) ev
+  ORDER BY occurred_at, sid, i, dup;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  UPDATE _dojo.gen_state SET next_id = off + n;
+  RETURN format('    %s  %s events', to_char(lo, 'YYYY "Q"Q'), to_char(n, 'FM999,999,999'));
+END
+$gen$;
+
+\pset tuples_only on
+\pset format unaligned
+SELECT format('SELECT _dojo.gen_events(%L, %L, %s, %s)', m, m + interval '3 months', :n_products, :pid_mult)
+FROM generate_series(timestamptz '2023-01-01', timestamptz '2025-10-01', interval '3 months') AS m
+\gexec
+\pset tuples_only off
+\pset format aligned
 
 ALTER TABLE events ADD PRIMARY KEY (event_id);
 COMMIT;
@@ -659,8 +688,8 @@ ALTER TABLE reviews        ADD FOREIGN KEY (user_id)     REFERENCES users (user_
 ALTER TABLE subscriptions  ADD FOREIGN KEY (user_id)     REFERENCES users (user_id);
 CREATE INDEX orders_user_id_idx ON orders (user_id);
 
-DROP TABLE _dojo.stg_sessions, _dojo.stg_orders, _dojo.leaf_price;
-DROP FUNCTION _dojo.cart_pid, _dojo.qty, _dojo.evt_offset, _dojo.base_email, _dojo.first_name, _dojo.last_name,
+DROP TABLE _dojo.stg_sessions, _dojo.stg_orders, _dojo.leaf_price, _dojo.gen_state;
+DROP FUNCTION _dojo.gen_events, _dojo.cart_pid, _dojo.qty, _dojo.evt_offset, _dojo.base_email, _dojo.first_name, _dojo.last_name,
               _dojo.skewed_rank, _dojo.pid, _dojo.pick, _dojo.rnorm, _dojo.rnd;
 
 VACUUM (ANALYZE) users, categories, products, product_prices, orders, order_items, events, reviews, subscriptions;

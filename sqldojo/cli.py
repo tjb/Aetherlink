@@ -47,6 +47,11 @@ def print_question(q: core.Question) -> None:
     elif q.kind == "state":
         print(yellow(f"Lab: change the database (./dojo psql, or ./dojo run {q.id} runs your scratch file), "
                      f"then check. Start over with ./dojo lab-reset {q.id}."))
+    elif q.kind == "pipeline":
+        print(yellow("Pipeline lab: check replays " + " → ".join("YOUR LOAD" if st == "answer" else st for st in q.plan)))
+        print(yellow(f"  Develop step by step: ./dojo lab-step {q.id} setup | "
+                     + " | ".join(f"./dojo lab-step {q.id} {st}" for st in q.steps[:2])
+                     + (" ..." if len(q.steps) > 2 else "") + f", then ./dojo run {q.id}"))
     print()
     print(q.prompt)
     print()
@@ -91,7 +96,7 @@ def cmd_up(args):
             print(yellow(f"The data was generated at scale {meta.get('scale')}. "
                          f"To change it: ./dojo generate --scale {args.scale:g}"))
         return
-    generate(args.scale if args.scale is not None else 1.0)
+    generate(args.scale if args.scale is not None else 1.0, args.force)
 
 
 def cmd_generate(args):
@@ -99,16 +104,16 @@ def cmd_generate(args):
     if meta and not confirm(f"This replaces the current dataset (scale={meta.get('scale')}) and drops "
                             "any indexes/tables you created. Continue?", args.yes):
         raise DojoError("aborted (use --yes to skip this prompt)")
-    generate(args.scale)
+    generate(args.scale, args.force)
 
 
-def generate(scale: float):
+def generate(scale: float, force: bool = False):
     print(bold(f"Generating the dataset at scale {scale:g} "
                f"(~{5.8 * scale:.1f}M events, ~{0.8 * scale:.1f} GB on disk, ~{0.75 * scale:.1f} min)."))
     if scale >= 5:
         print(yellow("Large scales take a while. Grab a coffee."))
     start = time.time()
-    core.generate_data(scale, print)
+    core.generate_data(scale, print, force=force)
     print(green(f"Done in {time.time() - start:.0f}s.") + " Start practising: ./dojo  (or ./dojo today)")
 
 
@@ -194,6 +199,14 @@ def start_question(q: core.Question):
     if q.setup_path and core.db_meta() and not core.lab_is_set_up(q):
         core.setup_lab(q)
         print(dim("Lab objects created."))
+
+
+def cmd_lab_step(args):
+    q = core.get_question(args.question)
+    if q.kind != "pipeline":
+        raise DojoError(f"Q{q.code} is not a pipeline lab (use ./dojo lab-reset {q.id})")
+    core.require_db()
+    print(core.run_lab_step(q, args.step))
 
 
 def cmd_lab_reset(args):
@@ -413,8 +426,10 @@ def build_parser() -> argparse.ArgumentParser:
     add("tui", None, "open the terminal IDE (same as running ./dojo with no command)")
     sp = add("up", cmd_up, "start Postgres; generates the data on first run")
     sp.add_argument("--scale", type=float, help="dataset size (default 1 = ~6M events)")
+    sp.add_argument("--force", action="store_true", help="skip the free-disk-space check")
     sp = add("generate", cmd_generate, "(re)generate the dataset")
     sp.add_argument("--scale", type=float, default=1.0)
+    sp.add_argument("--force", action="store_true", help="skip the free-disk-space check")
     sp.add_argument("-y", "--yes", action="store_true")
     add("down", cmd_down, "stop Postgres (data is kept)")
     sp = add("destroy", cmd_destroy, "remove the container and its data")
@@ -449,8 +464,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--file")
     sp.add_argument("--no-analyze", action="store_true", help="plan only, don't execute")
     sp.add_argument("--timeout", type=int, default=core.DEFAULT_TIMEOUT_S)
-    sp = add("lab-reset", cmd_lab_reset, "rebuild a lab's objects (Level 6)")
+    sp = add("lab-reset", cmd_lab_reset, "rebuild a lab's objects (Levels 6+)")
     sp.add_argument("question")
+    sp = add("lab-step", cmd_lab_step, "run one step of a pipeline lab, e.g. batch_1 (Level 7)")
+    sp.add_argument("question")
+    sp.add_argument("step")
     sp = add("reset", cmd_reset, "drop indexes/views/tables you created")
     sp.add_argument("-y", "--yes", action="store_true")
     sp = add("selftest", cmd_selftest, "run every reference query (for CI / question authors)")

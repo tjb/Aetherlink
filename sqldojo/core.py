@@ -31,6 +31,7 @@ LEVELS = {
     4: "Advanced SQL",
     5: "Performance",
     6: "Production Postgres",
+    7: "Modeling & ELT",
 }
 # kind of question:
 #   query   one SELECT, graded by comparing its result with the reference
@@ -38,7 +39,10 @@ LEVELS = {
 #           rolled back; check.sql then inspects the state it produced
 #   state   you change the database yourself (any statements, any way you like);
 #           check.sql inspects the result
-KINDS = ("query", "script", "state")
+#   pipeline  your answer is a load script; the checker replays a plan such as
+#           "setup, batch_1, answer, answer, batch_2, answer, answer, check" (new data lands
+#           between runs, every run happens twice to prove it's idempotent), then check.sql
+KINDS = ("query", "script", "state", "pipeline")
 DATASET_TABLES = ["users", "categories", "products", "product_prices", "orders",
                   "order_items", "events", "reviews", "subscriptions"]
 NULL = "<NULL>"
@@ -76,6 +80,13 @@ class Question:
             raise ValueError(f"{path.name}: unknown kind {self.kind!r}")
         self.run_as = meta.get("run_as") or None
         self.setup_path = path / "setup.sql" if (path / "setup.sql").exists() else None
+        self.plan = _split_list(meta.get("plan", "setup, answer, answer, check")) if self.kind == "pipeline" else []
+        self.steps = [st for st in self.plan if st not in ("setup", "answer", "check")]
+        for st in self.steps:
+            if not (path / f"{st}.sql").exists():
+                raise ValueError(f"{path.name}: plan step {st!r} has no {st}.sql")
+        if self.plan and (self.plan[-1] != "check" or "answer" not in self.plan):
+            raise ValueError(f"{path.name}: a pipeline plan needs at least one 'answer' and must end with 'check'")
         self.check_path = path / "check.sql"
         self.solution_path = path / "solution.sql"
         # Performance questions grade against the original (slow but correct) query.
@@ -131,6 +142,9 @@ class Question:
         elif self.kind == "state":
             out.append("🧪 **Lab:** change the database however you like (the editor runs any statements), "
                        "then check.")
+        elif self.kind == "pipeline":
+            out.append("🧪 **Pipeline lab:** your answer is a load script. Checking replays: "
+                       + " → ".join(f"`{st}`" if st not in ("answer",) else "**your load**" for st in self.plan))
         out.append("")
         out.append(self.prompt)
         return "\n".join(out)
@@ -263,6 +277,9 @@ _STUB_HELP = {
               "-- inside a transaction that is rolled back. Check it with ./dojo check {id} (Ctrl+T).",
     "state": "-- Lab scratchpad. Ctrl+R (./dojo run {id}) runs everything here as the superuser,\n"
              "-- statement by statement, with autocommit. Then check the result with Ctrl+T.",
+    "pipeline": "-- Your load script (any statements). Ctrl+R / ./dojo run {id} runs it against the lab as it\n"
+                "-- is now; land data with the lab steps (Ctrl+P, or ./dojo lab-step {id} <step>).\n"
+                "-- Ctrl+T / ./dojo check {id} replays the whole pipeline from scratch.",
 }
 
 
@@ -625,10 +642,64 @@ def start_database(on_line: Callable[[str], None]) -> None:
         raise DojoError("docker compose up failed (see the output above)")
 
 
-def generate_data(scale: float, on_line: Callable[[str], None]) -> None:
+# Peak disk use while generating, measured: the finished dataset plus temporary sort files.
+_GB = 1024 ** 3
+_PEAK_GB_PER_SCALE = 1.1
+_PEAK_GB_FIXED = 0.5
+
+
+def disk_needed_bytes(scale: float) -> int:
+    return int((_PEAK_GB_FIXED + _PEAK_GB_PER_SCALE * scale) * _GB)
+
+
+def container_free_bytes() -> Optional[int]:
+    """Free space on the disk holding the database (inside Docker's VM), or None if unknown."""
+    if using_custom_psql():
+        return None
+    try:
+        proc = subprocess.run(COMPOSE + ["exec", "-T", "db", "df", "-Pk", "/var/lib/postgresql/data"],
+                              capture_output=True, text=True, timeout=30)
+        return int(proc.stdout.strip().splitlines()[-1].split()[3]) * 1024 if proc.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, IndexError, ValueError):
+        return None
+
+
+def _reclaimable_bytes() -> int:
+    """Space the generator frees when it drops the current data."""
+    try:
+        rows = query_rows("SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0) FROM pg_class c "
+                          "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                          "WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'm');")
+        return int(rows[0][0])
+    except (DojoError, IndexError, ValueError):
+        return 0
+
+
+def disk_problem(scale: float) -> Optional[str]:
+    free = container_free_bytes()
+    if free is None:
+        return None
+    need, have = disk_needed_bytes(scale), free + _reclaimable_bytes()
+    if have >= need:
+        return None
+    return (f"Not enough disk space inside Docker for scale {scale:g}: generating needs about "
+            f"{need / _GB:.0f} GB and only {have / _GB:.1f} GB is available.\n"
+            "Docker Desktop keeps images, containers and volumes in a virtual disk with its own size "
+            "limit, separate from your computer's free space. Raise it in Docker Desktop → Settings → "
+            "Resources → Advanced (disk usage limit), free space with `docker system prune`, or pick a "
+            "smaller scale. (./dojo generate --force tries anyway.)")
+
+
+def generate_data(scale: float, on_line: Callable[[str], None], force: bool = False) -> None:
     if scale <= 0:
         raise DojoError("scale must be positive")
-    if stream(generate_cmd(scale), on_line, stdin_path=GENERATOR) != 0:
+    problem = disk_problem(scale)
+    if problem and not force:
+        raise DojoError(problem)
+
+    def clean(line: str) -> None:
+        on_line(re.sub(r"^psql:<stdin>:\d+: ", "", line))
+    if stream(generate_cmd(scale), clean, stdin_path=GENERATOR) != 0:
         raise DojoError("generation failed (see the output above)")
 
 
@@ -807,6 +878,16 @@ def setup_lab(q: Question) -> None:
         raise DojoError(f"setting up the lab failed:\n{_clean_error(proc)}")
 
 
+def run_lab_step(q: Question, step: str) -> str:
+    """Run one step of a pipeline lab (setup or a data step like batch_1). Returns psql output."""
+    if step == "setup":
+        setup_lab(q)
+        return "Lab reset."
+    if step not in q.steps:
+        raise DojoError(f"Q{q.code} has no step {step!r}. Steps: setup, {', '.join(q.steps)}")
+    return run_script((q.dir / f"{step}.sql").read_text(encoding="utf-8"))
+
+
 def _parse_checks(csv_text: str) -> List[Tuple[str, bool, str]]:
     csv.field_size_limit(max(csv.field_size_limit(), 16 * 1024 * 1024))
     rows = list(csv.reader(io.StringIO(csv_text.strip("\n"))))
@@ -824,6 +905,9 @@ _MARK = "__DOJO_CHECK__"
 def _grade_lab(q: Question, sql: str, g: "Grade", timeout_s: int,
                on_status: Optional[Callable[[str], None]]) -> None:
     check_sql = q.check_path.read_text(encoding="utf-8")
+    if q.kind == "pipeline":
+        _grade_pipeline(q, sql, check_sql, g, timeout_s, on_status)
+        return
     if q.kind == "script":
         validate_script(sql)
         if on_status:
@@ -853,6 +937,44 @@ def _grade_lab(q: Question, sql: str, g: "Grade", timeout_s: int,
         return
     before, _, after = proc.stdout.partition(_MARK + "\n")
     g.output = before.strip("\n")
+    g.checks = _parse_checks(after)
+    g.correct = bool(g.checks) and all(ok for _, ok, _ in g.checks)
+
+
+_STEP = "[dojo] "
+
+
+def _grade_pipeline(q: Question, sql: str, check_sql: str, g: "Grade", timeout_s: int,
+                    on_status: Optional[Callable[[str], None]]) -> None:
+    if not split_statements(sql):
+        raise QueryError("no SQL found (the file only has comments)")
+    session = f"SET application_name = '{APP_NAME}';\nSET statement_timeout = '{timeout_s}s';\n"
+    parts = [session, f"\\pset null '{NULL}'"]
+    runs, last_data = 0, "setup"
+    for step in q.plan:
+        if step == "setup":
+            parts += [f"\\echo '{_STEP}resetting the lab'", q.setup_path.read_text(encoding="utf-8"), ";",
+                      _LABS_TABLE, f"INSERT INTO _dojo.labs VALUES ({q.id}, now()) "
+                      "ON CONFLICT (question_id) DO UPDATE SET set_up_at = now();"]
+        elif step == "answer":
+            runs += 1
+            parts += [f"\\echo '{_STEP}your load, run {runs} (after {last_data})'", sql, ";",
+                      "RESET ALL;", session]  # your SETs don't leak into the next step
+        elif step == "check":
+            parts += [f"\\echo {_MARK}", "\\pset format csv", check_sql, ";"]
+        else:
+            last_data = step
+            parts += [f"\\echo '{_STEP}landing {step}'", (q.dir / f"{step}.sql").read_text(encoding="utf-8"), ";"]
+    if on_status:
+        on_status("Replaying the pipeline: " + " → ".join("your load" if st == "answer" else st for st in q.plan))
+    proc = psql("\n".join(parts) + "\n", timeout=timeout_s * max(1, runs) + 120)
+    before, _, after = proc.stdout.partition(_MARK + "\n")
+    g.output = before.strip("\n")
+    if proc.returncode != 0:
+        steps = [ln[len(_STEP):] for ln in proc.stdout.splitlines() if ln.startswith(_STEP)]
+        where = f"Failed during: {steps[-1]}\n" if steps else ""
+        g.error = where + _clean_error(proc)
+        return
     g.checks = _parse_checks(after)
     g.correct = bool(g.checks) and all(ok for _, ok, _ in g.checks)
 

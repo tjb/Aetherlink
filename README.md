@@ -29,7 +29,9 @@ git clone <this repo> sql-dojo && cd sql-dojo
 ```
 
 The first run installs the terminal UI into `./.venv`, starts Postgres 17 in Docker and generates
-the dataset (pick a scale; 1 is a good start). Then:
+the dataset (pick a scale; 1 is a good start). Bigger scales need free space *inside Docker*: about
+12 GB for scale 10. Docker Desktop has its own disk limit, separate from your computer's free space
+(*Settings → Resources → Advanced*); `./dojo` checks before generating. Then:
 
 | Key | |
 |---|---|
@@ -61,6 +63,7 @@ materialized views, then check again.
 | **4 · Advanced SQL** | 25 Prices as of a date · 26 Latest orders with LATERAL · 27 Tracking loss (JSONB) · 28 Duplicate events · 29 What time do people buy? |
 | **5 · Performance** ⏱ | 30 Latest activity per user · 31 Make it sargable · 32 Precompute monthly actives · 33 Events before purchase |
 | **6 · Production Postgres** ⚗ | 34 TRUNCATE blast radius · 35 Migration without TRUNCATE · 36 DELETE vs TRUNCATE on disk · 37 Fail fast with lock_timeout · 38 Privilege audit · 39 Make updates HOT |
+| **7 · Modeling & ELT** ⚗ | 40 Bulk load with COPY · 41 Data quality tests · 42 Build a star schema · 43 Sync a catalog with MERGE · 44 Slowly changing dimension · 45 Late-arriving data · 46 Partitioning and retention |
 
 Along the way: join fan-out, anti-joins, three-valued logic, `FILTER`, window frames, gap filling,
 gaps-and-islands, recursive CTEs, closure tables, `LATERAL`, `GROUPING SETS`, as-of joins, interval
@@ -76,6 +79,15 @@ comparing a result set, the checker inspects what you did to the database:
 
 They cover `TRUNCATE` vs `DELETE` (privileges, locks, MVCC, what happens on disk), foreign-key
 cascades, lock queues and `lock_timeout`, role inheritance, VACUUM, fillfactor and HOT updates.
+
+**Level 7 is data engineering in SQL.** It adds *pipeline labs*: your answer is a load script, and
+the checker plays the outside world. It resets the lab, lands batch 1, runs your load **twice**
+(retries must be harmless), lands batch 2, runs it twice again, and so on, then compares your
+tables with the truth. You build a star schema, bulk-load a messy CSV with `COPY`, sync a
+supplier catalogue with `MERGE` (soft deletes included), keep a type-2 slowly changing
+dimension, maintain an incremental rollup while late data arrives, and manage retention with
+partitions. While developing, run the steps yourself: *Lab step* in the command palette, or
+`./dojo lab-step 45 batch_1`.
 
 Adding your own questions takes a markdown file and a SQL file: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -105,6 +117,7 @@ Everything the TUI does is also a command, using only Python's standard library:
 ./dojo psql                 interactive psql
 ./dojo reset                drop the indexes, views and tables you created
 ./dojo lab-reset 36         rebuild a lab's objects and start it over
+./dojo lab-step 45 batch_1  pipeline labs: land the next batch of data by hand
 ./dojo down | destroy       stop the container / delete it and its data
 ```
 
@@ -125,8 +138,9 @@ change it with `DOJO_PORT`). To use a Postgres you run yourself instead of Docke
   column order does.
 - Performance questions run your query 3 times and take the best time. Some targets scale with the
   dataset size (`× scale`).
-- Labs are graded by `check.sql`, which returns one row per check. Their objects live in the `lab`
-  schema and a few roles (`app_migrator`, `analyst`, ...). Regenerating the data rebuilds them on demand.
+- Labs are graded by `check.sql`, which returns one row per check. Their objects live in their own
+  schemas (`lab`, `partner`, `mart`, `stream`, ...) and a few roles (`app_migrator`, `analyst`,
+  ...). Regenerating the data rebuilds them on demand.
 
 ## Other places to practise
 

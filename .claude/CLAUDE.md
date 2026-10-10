@@ -36,9 +36,11 @@ To use a database other than the compose one, set `DOJO_PSQL="psql postgresql://
 - `questions/NNN-slug/`: `question.md` (front matter + prompt + `## Hints`), `solution.sql`
   (explanatory comments + one query), optional `expected.sql` (performance questions grade against
   the original slow query). Format details are in `CONTRIBUTING.md`.
-- Level 6 labs: `kind: script` (answer = migration script run as `run_as` inside a rolled-back
-  transaction) or `kind: state` (learner changes the DB; `check.sql` inspects it). Labs have
-  `setup.sql` (idempotent, objects in schema `lab`) and `check.sql` returning `(check, ok, detail)`.
+- Labs (Levels 6+): `kind: script` (answer = migration script run as `run_as` inside a rolled-back
+  transaction), `kind: state` (learner changes the DB; `check.sql` inspects it) or `kind: pipeline`
+  (answer = load script; `plan:` replays setup, data steps like `batch_1.sql`, and the answer twice
+  per batch, then check). Labs have `setup.sql` (idempotent, own schema) and `check.sql`
+  returning `(check, ok, detail)`. Lab schemas are listed in the `DROP SCHEMA` in `db/generate.sql`.
 - `answers/`: the learner's work and `progress.json`. Never commit test answers or progress here.
 - `.github/workflows/`: CI (unit tests + generate at scale 0.05 + selftest + TUI smoke test) and an
   optional daily-question issue workflow (schedule commented out by default; also closes solved issues).

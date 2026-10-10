@@ -26,12 +26,15 @@ categories ─┬─< categories (parent_id)          users ─┬─< users (re
 
 ## Size
 
-| scale | users | events | orders | disk | generation* |
-|------:|------:|-------:|-------:|-----:|-----------:|
-| 0.05 | 5k | 0.3M | 4.7k | 50 MB | 4 s |
-| 1 (default) | 100k | 5.8M | 92k | 0.8 GB | 45 s |
-| 5 | 500k | 29M | 457k | 3.8 GB | 3.6 min |
-| 10 | 1M | 58M | 0.9M | ~7.5 GB | ~8 min |
+| scale | users | events | orders | disk | free space needed while generating | generation* |
+|------:|------:|-------:|-------:|-----:|------:|-----------:|
+| 0.05 | 5k | 0.3M | 4.7k | 50 MB | 1 GB | 9 s |
+| 1 (default) | 100k | 5.8M | 92k | 0.8 GB | 2 GB | 50 s |
+| 5 | 500k | 29M | 457k | 4 GB | 6 GB | 3.5 min |
+| 10 | 1M | 58M | 0.9M | 8 GB | 12 GB | ~7 min |
+
+The free space is inside **Docker's own virtual disk**, not your computer's. Docker Desktop caps it
+(*Settings → Resources → Advanced*), and `./dojo generate` checks before it starts.
 
 \* on a 4-core cloud VM; a recent laptop is usually faster. Products grow with √scale
 (5,000 at scale 1).
@@ -130,11 +133,12 @@ Deliberately minimal: primary keys, foreign keys (constraints only) and `orders(
 Choosing the right indexes is part of the curriculum. `./dojo reset` (or *Reset objects I
 created* in the TUI) drops everything you add and returns to this baseline.
 
-## Labs (Level 6)
+## Labs (Levels 6 and 7)
 
-Lab questions create their own objects in the **`lab`** schema (and a few roles: `app_migrator`,
-`analyst`, `app_rw`, `etl`, `oncall`, `intern`) the first time you open them. Rebuild one with
-*Reset this lab* (`./dojo lab-reset N`). Regenerating the dataset drops the `lab` schema too.
+Lab questions create their own objects the first time you open them: Level 6 in schema **`lab`**
+(plus a few roles: `app_migrator`, `analyst`, `app_rw`, `etl`, `oncall`, `intern`), Level 7 in a
+schema per lab (`partner`, `dq`, `mart`, `supplier`, `crm`, `stream`, `archive`). Rebuild one with
+*Reset this lab* (`./dojo lab-reset N`). Regenerating the dataset drops all of them.
 
 ## Realistic dirt
 

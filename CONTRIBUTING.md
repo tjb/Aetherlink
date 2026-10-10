@@ -63,6 +63,13 @@ questions/035-my-lab/
 - **script**: the answer file is a script. Each check runs `setup.sql`, then `BEGIN; SET LOCAL ROLE
   <run_as>; <your script>; RESET ROLE; <check.sql>; ROLLBACK;`. Transaction control and role
   switching are refused in the script.
+- **pipeline**: the answer is a load script. Front matter `plan:` lists the steps, e.g.
+  `setup, batch_1, answer, answer, batch_2, answer, answer, check`. `setup` runs `setup.sql`,
+  `answer` runs the learner's script, any other name runs `<name>.sql` from the question
+  directory (landing new data), and `check` must come last. Run `answer` twice in a row to
+  enforce idempotency. Give each pipeline lab its own schema and drop it in `setup.sql`, so
+  helper tables the learner creates can't survive into the next run (and add the schema to the
+  `DROP SCHEMA` list in `db/generate.sql`).
 - **state**: the learner changes the database however they like. `check.sql` runs on the current
   state and may use its own `BEGIN ... ROLLBACK` to try things (see Q039). `setup.sql` runs when
   the lab is first opened and on *Reset this lab*.

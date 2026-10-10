@@ -113,7 +113,7 @@ class SetupScreen(ModalScreen[bool]):
             yield Static(
                 "This starts Postgres 17 in Docker (container [b]sql-dojo-db[/b], port 5433) and generates "
                 "the Larkspur dataset inside it. [b]Scale 1[/b] ≈ 6M events, ~0.8 GB, under a minute. "
-                "Scale 10 ≈ 58M events, ~7.5 GB, ~8 minutes. You can change it later from the command "
+                "Scale 10 ≈ 58M events, ~8 GB (needs ~12 GB free inside Docker while generating), ~7 minutes. You can change it later from the command "
                 "palette (Ctrl+P).", classes="muted")
             if self.regenerate:
                 yield Static("[b $warning]This replaces the data and drops indexes/views you created.[/]")
@@ -316,6 +316,8 @@ class DojoApp(App):
             if q.kind == "state" else
             f"[dim]Ctrl+R runs your script as yourself (superuser, autocommit). Ctrl+T runs it as "
             f"{q.run_as} and rolls back.[/dim]" if q.kind == "script" else
+            "[dim]Ctrl+R runs your load against the lab as it is now. Land data with Ctrl+P → Lab step. "
+            "Ctrl+T replays the whole pipeline.[/dim]" if q.kind == "pipeline" else
             "[dim]Run your query with Ctrl+R (or F5).[/dim]")
         self.query_one("#check-log", RichLog).clear()
         self.query_one("#plan-log", RichLog).clear()
@@ -337,6 +339,16 @@ class DojoApp(App):
                 self.call_from_thread(self.notify, f"Lab for Q{q.code} is ready.")
         except DojoError as e:
             self.call_from_thread(self.notify, str(e), severity="error", timeout=10)
+
+    @work(thread=True, exclusive=True, group="db")
+    def lab_step(self, q: core.Question, step: str) -> None:
+        try:
+            output, error = core.run_lab_step(q, step), None
+        except DojoError as e:
+            output, error = "", str(e)
+        self.call_from_thread(self.show_script_output, f"-- lab step: {step}\n{output}", error)
+        self.call_from_thread(self.notify, f"Ran {step}" if not error else f"{step} failed",
+                              severity="information" if not error else "error")
 
     def render_hints(self) -> None:
         q = self.current
@@ -654,6 +666,10 @@ class DojoApp(App):
         if self.current is not None and self.current.setup_path:
             yield SystemCommand("Reset this lab", f"Rebuild the lab objects for Q{self.current.code}",
                                 lambda: self.ensure_lab(self.current, force=True))
+        if self.current is not None:
+            for step in self.current.steps:
+                yield SystemCommand(f"Lab step: {step}", f"Run {step}.sql for Q{self.current.code} (lands data)",
+                                    lambda step=step: self.lab_step(self.current, step))
         yield SystemCommand("Explain (plan only)", "EXPLAIN without running the query",
                             lambda: self.action_explain(analyze=False))
         yield SystemCommand("Next unsolved question", "Jump ahead", self.action_next)
