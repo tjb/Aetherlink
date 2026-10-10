@@ -1134,14 +1134,17 @@ def _run_parallel(path: Path, n: int, timeout_s: int) -> Optional[str]:
     run = os.urandom(8).hex()
     # Starting a session can take a second (docker compose exec), so they wait for each other
     # before running the step: otherwise the first one could be done before the last connects.
-    barrier = (f"SET client_min_messages = warning;\n{_BARRIER_TABLE}\n"
-               f"INSERT INTO _dojo.barrier VALUES ('{run}', :worker);\n"
+    # The table is created here, once: concurrent CREATE TABLE IF NOT EXISTS can collide.
+    proc = psql(f"SET client_min_messages = warning;\n{_BARRIER_TABLE}\n")
+    if proc.returncode != 0:
+        return _clean_error(proc)
+    barrier = (f"INSERT INTO _dojo.barrier VALUES ('{run}', :worker);\n"
                "DO $$ BEGIN\n"
-               f"  FOR i IN 1..3000 LOOP  -- at most 30 s\n"
+               "  FOR i IN 1..3000 LOOP  -- at most 30 s\n"
                f"    EXIT WHEN (SELECT count(*) FROM _dojo.barrier WHERE run = '{run}') >= {n};\n"
                "    PERFORM pg_sleep(0.01);\n"
                "  END LOOP;\n"
-               "END $$;\nRESET client_min_messages;\n")
+               "END $$;\n")
     script = (f"SET application_name = '{APP_NAME}';\n{barrier}SET statement_timeout = '{timeout_s}s';\n"
               + path.read_text(encoding="utf-8"))
     procs = []
