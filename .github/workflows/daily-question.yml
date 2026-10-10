@@ -1,11 +1,16 @@
 name: Daily SQL question
 
-# Opens one issue per day with the next question you haven't solved or been sent yet.
-# GitHub emails you about it (you're @mentioned), Interview Cake style.
-# Change the time below (UTC) to whenever you like your question.
+# OPTIONAL, and off by default: ./dojo already remembers where you left off.
+#
+# If you'd like a nudge, this opens one GitHub issue a day with the next question you haven't
+# solved or been sent yet, and @mentions you so GitHub emails it. It also closes the issues of
+# questions you've solved (from the answers/progress.json you've pushed).
+#
+# To turn it on, uncomment the two `schedule` lines (the time is UTC) and push to your default
+# branch. "Run workflow" on the Actions tab sends one right away.
 on:
-  schedule:
-    - cron: "47 12 * * *"
+  # schedule:
+  #   - cron: "47 12 * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,14 +20,25 @@ permissions:
 jobs:
   ask:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-      - name: Pick the next question
-        id: pick
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Close issues for solved questions
         run: |
           gh label create sql-dojo --color 5319e7 --description "Daily SQL Dojo question" 2>/dev/null || true
+          solved=$(python3 -c "import json, os; p = json.load(open('answers/progress.json')) if os.path.exists('answers/progress.json') else {}; print(' '.join(k for k, v in p.items() if v.get('solved_at')))")
+          gh issue list --label sql-dojo --state open --limit 1000 --json number,title \
+            --jq '.[] | "\(.number) \(.title)"' |
+          while read -r number title; do
+            code=$(echo "$title" | sed -nE 's/^\[Q([0-9]+)\].*/\1/p')
+            if [ -n "$code" ] && echo " $solved " | grep -q " $code "; then
+              gh issue close "$number" --reason completed --comment "Solved ✔ Nice work."
+            fi
+          done
+      - name: Pick the next question
+        id: pick
+        run: |
           posted=$(gh issue list --label sql-dojo --state all --limit 1000 --json title --jq '.[].title' \
                    | sed -nE 's/^\[Q0*([0-9]+)\].*/\1/p' | tr '\n' ' ')
           id=$(python3 dojo today --id-only --exclude "$posted")
@@ -31,7 +47,6 @@ jobs:
       - name: Open the issue
         if: steps.pick.outputs.id != ''
         env:
-          GH_TOKEN: ${{ github.token }}
           QID: ${{ steps.pick.outputs.id }}
           OWNER: ${{ github.repository_owner }}
         run: |

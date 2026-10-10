@@ -68,6 +68,15 @@ class TuiSmokeTest(unittest.TestCase):
             await self._settle(app, pilot)
             self.assertEqual(app.current.id, 2)
 
+            app.load_question(core.get_question(5))
+            await self._settle(app, pilot)
+
+        # a new session picks up where the last one left off
+        app = DojoApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await self._settle(app, pilot)
+            self.assertEqual(app.current.id, 5)
+
     @staticmethod
     async def _settle(app, pilot):
         await pilot.pause(0.3)

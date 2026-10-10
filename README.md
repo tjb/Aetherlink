@@ -4,7 +4,7 @@
 
 SQL Dojo gives you a realistic, messy e-commerce warehouse in a local Postgres (5.8M events at the
 default size, 58M if you want), a curriculum of graded questions from `GROUP BY` to query tuning,
-and a terminal IDE to work through them. A daily question can arrive as a GitHub issue in your inbox.
+and a terminal IDE to work through them. Open it, and it picks up where you left off.
 
 ![The SQL Dojo terminal IDE](docs/screenshot.png)
 
@@ -43,9 +43,10 @@ the dataset (pick a scale; 1 is a good start). Then:
 | `Ctrl+P` | Command palette: start/regenerate the database, reset indexes, explain without running, ... |
 | `F1` | Help |
 
-Your answers autosave to `answers/NNN.sql` and your progress to `answers/progress.json`. Commit
-them: your solutions become a portfolio, and the daily-question workflow uses them to skip what
-you've already solved.
+**It picks up where you left off.** Each launch reopens the question you were on, with your
+draft (answers autosave to `answers/NNN.sql`). If you'd finished it, you get the next unsolved
+question instead. `./dojo today` does the same from the shell. Your progress (attempts, hints,
+solve dates, best times) is in `answers/progress.json`. Commit `answers/`: it's your SQL portfolio.
 
 For performance questions, open a second terminal with `./dojo psql` to create indexes or
 materialized views, then check again.
@@ -78,19 +79,14 @@ cascades, lock queues and `lock_timeout`, role inheritance, VACUUM, fillfactor a
 
 Adding your own questions takes a markdown file and a SQL file: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## A daily question in your inbox
+## Optional: a daily question by email
 
-The [`Daily SQL question`](.github/workflows/daily-question.yml) workflow opens one GitHub issue a
-day with the next question you haven't solved or been sent yet: the problem, collapsible hints and
-the commands to start. You're @mentioned, so GitHub emails it to you.
-
-1. Push this repo to GitHub with these files on the default branch. Scheduled workflows only run there.
-2. Make sure Actions are enabled (*Settings → Actions*), then run the workflow once by hand
-   (*Actions → Daily SQL question → Run workflow*) to get your first question.
-3. Change the `cron` line to pick your time (it's in UTC).
-
-When you solve one, commit and push `answers/`. The
-[`Close solved questions`](.github/workflows/close-solved.yml) workflow closes its issue.
+Off by default. If you'd like a nudge, the [`Daily SQL question`](.github/workflows/daily-question.yml)
+workflow can open one GitHub issue a day with the next question you haven't solved or been sent
+yet (the problem, collapsible hints, the commands to start) and @mention you, so GitHub emails it.
+To switch it on, uncomment the two `schedule` lines in that file (the time is UTC) and push to your
+default branch. *Actions → Daily SQL question → Run workflow* sends one immediately. Each run
+also closes the issues of questions you've solved, based on the `answers/progress.json` you've pushed.
 
 ## The plain CLI
 
@@ -99,7 +95,7 @@ Everything the TUI does is also a command, using only Python's standard library:
 ```
 ./dojo up [--scale 1]       start Postgres; generate data on first run
 ./dojo generate --scale 10  regenerate at another size (bigger = more interesting plans)
-./dojo today                next unsolved question; creates answers/NNN.sql
+./dojo today                pick up where you left off (or the next unsolved question)
 ./dojo run 7                run your answer, print the result
 ./dojo check 7              grade it
 ./dojo hint 7               reveal one more hint

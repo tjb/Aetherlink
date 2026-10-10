@@ -40,8 +40,9 @@ To use a database other than the compose one, set `DOJO_PSQL="psql postgresql://
   transaction) or `kind: state` (learner changes the DB; `check.sql` inspects it). Labs have
   `setup.sql` (idempotent, objects in schema `lab`) and `check.sql` returning `(check, ok, detail)`.
 - `answers/`: the learner's work and `progress.json`. Never commit test answers or progress here.
-- `.github/workflows/`: CI (unit tests + generate at scale 0.05 + selftest + TUI smoke test), daily
-  question issue, close solved issues.
+- `.github/workflows/`: CI (unit tests + generate at scale 0.05 + selftest + TUI smoke test) and an
+  optional daily-question issue workflow (schedule commented out by default; also closes solved issues).
+- "Where you left off" lives in `answers/.session.json` (gitignored); `core.resume_question()`.
 
 ## Conventions for questions
 

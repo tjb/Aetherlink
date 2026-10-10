@@ -217,9 +217,42 @@ def is_solved(progress: dict, q: Question) -> bool:
 
 
 def next_question(exclude=()) -> Optional[Question]:
+    """The lowest-numbered unsolved question."""
     progress = load_progress()
     for q in load_questions():
         if not is_solved(progress, q) and q.id not in exclude:
+            return q
+    return None
+
+
+# Where you left off. A local file (gitignored): it changes every time you switch questions.
+def _session_file() -> Path:
+    return ANSWERS_DIR / ".session.json"
+
+
+def remember_question(q: Question) -> None:
+    ANSWERS_DIR.mkdir(exist_ok=True)
+    _session_file().write_text(json.dumps({"last_question": q.id, "at": now_iso()}) + "\n", encoding="utf-8")
+
+
+def last_question_id() -> Optional[int]:
+    try:
+        return int(json.loads(_session_file().read_text(encoding="utf-8"))["last_question"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def resume_question() -> Optional[Question]:
+    """The question you were last on. If you finished it, the next unsolved one after it."""
+    qs = load_questions()
+    last = last_question_id()
+    ids = [q.id for q in qs]
+    if last not in ids:
+        return next_question()
+    progress = load_progress()
+    i = ids.index(last)
+    for q in qs[i:] + qs[:i]:
+        if not is_solved(progress, q):
             return q
     return None
 

@@ -1,6 +1,7 @@
 # Local tooling
 .venv/
 .dojo-cache/
+answers/.session.json
 __pycache__/
 *.pyc
 

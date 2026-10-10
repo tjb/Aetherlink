@@ -253,9 +253,14 @@ class DojoApp(App):
     def on_mount(self) -> None:
         self.query_one("#schema", Tree).show_root = False
         self.refresh_question_list()
-        first = core.next_question() or (self.questions[0] if self.questions else None)
+        last = core.last_question_id()
+        first = core.resume_question() or (self.questions[0] if self.questions else None)
         if first:
             self.load_question(first)
+            if last is not None:
+                note = (f"Picking up where you left off: Q{first.code}" if first.id == last
+                        else f"Q{last:03d} is done. Next up: Q{first.code}")
+                self.notify(note, title="Welcome back")
         self.query_one("#editor").focus()
         self.check_database()
 
@@ -296,6 +301,7 @@ class DojoApp(App):
         self.save_answer()
         self.current = q
         core.ensure_stub(q)
+        core.remember_question(q)
         self._loading_text = True
         self.query_one("#editor", TextArea).load_text(q.answer_path.read_text(encoding="utf-8"))
         self.query_one("#question-md", Markdown).update(q.markdown())

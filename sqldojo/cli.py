@@ -168,12 +168,13 @@ def cmd_list(args):
 
 
 def cmd_next(args):
-    exclude = {int(x) for x in re.split(r"[\s,]+", args.exclude or "") if x.strip()}
-    q = core.next_question(exclude)
-    if args.id_only:
+    if args.id_only:  # used by the daily-question workflow
+        exclude = {int(x) for x in re.split(r"[\s,]+", args.exclude or "") if x.strip()}
+        q = core.next_question(exclude)
         if q:
             print(q.id)
         return
+    q = core.resume_question()
     if q is None:
         print(green("You've solved every question. 🎉 Add your own in questions/ (see CONTRIBUTING.md)."))
         return
@@ -186,6 +187,7 @@ def cmd_start(args):
 
 def start_question(q: core.Question):
     created = core.ensure_stub(q)
+    core.remember_question(q)
     print_question(q)
     if created:
         print(dim(f"Created answers/{q.code}.sql"))
@@ -378,7 +380,7 @@ def cmd_issue(args):
             "./dojo up                # first time: starts Postgres and generates the data",
             f"./dojo start {q.id:<12}# creates answers/{q.code}.sql",
             f"./dojo check {q.id}", "```",
-            f"When it passes, commit with `Solve Q{q.code}, closes #<this issue>` to close this issue."]
+            "When it passes, commit and push `answers/`: the next daily run closes this issue."]
     print("\n".join(out))
 
 
@@ -420,7 +422,7 @@ def build_parser() -> argparse.ArgumentParser:
     add("psql", cmd_psql, "open an interactive psql shell")
     add("status", cmd_status, "dataset info and your progress")
     add("list", cmd_list, "all questions", aliases=["ls"])
-    sp = add("today", cmd_next, "the next unsolved question", aliases=["next"])
+    sp = add("today", cmd_next, "pick up where you left off (or the next unsolved question)", aliases=["next"])
     sp.add_argument("--id-only", action="store_true", help=argparse.SUPPRESS)
     sp.add_argument("--exclude", help=argparse.SUPPRESS)
     sp = add("start", cmd_start, "start a specific question")
