@@ -12,6 +12,7 @@ import re
 import shlex
 import subprocess
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -1147,27 +1148,26 @@ def _run_parallel(path: Path, n: int, timeout_s: int) -> Optional[str]:
                "END $$;\n")
     script = (f"SET application_name = '{APP_NAME}';\n{barrier}SET statement_timeout = '{timeout_s}s';\n"
               + path.read_text(encoding="utf-8"))
-    procs = []
-    for i in range(1, n + 1):
+    def session(i: int) -> Optional[str]:
+        """One psql session; returns its error, if any."""
         cmd = psql_cmd() + ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-v", f"worker={i}", "-f", "-"]
-        procs.append(subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      text=True, encoding="utf-8"))
-    for proc in procs:  # start them all, then feed them, so they really overlap
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8")
         try:
-            proc.stdin.write(script)
-            proc.stdin.close()
-        except BrokenPipeError:  # it exited already (can't connect?): its stderr says why
-            pass
-    errors: Dict[str, List[int]] = {}  # message -> sessions that hit it
-    for i, proc in enumerate(procs, start=1):
-        try:
-            _, err = proc.communicate(timeout=timeout_s + 60)
+            _, err = proc.communicate(input=script, timeout=timeout_s + 60)
         except subprocess.TimeoutExpired:
             proc.kill()
-            errors.setdefault("timed out", []).append(i)
-            continue
-        if proc.returncode != 0:
-            msg = re.sub(r"^psql:<stdin>:\d+: ", "", err.strip(), flags=re.M) or f"exit code {proc.returncode}"
+            proc.communicate()
+            return "timed out"
+        if proc.returncode == 0:
+            return None
+        return re.sub(r"^psql:<stdin>:\d+: ", "", err.strip(), flags=re.M) or f"exit code {proc.returncode}"
+
+    with ThreadPoolExecutor(max_workers=n) as pool:  # one thread per session, all at once
+        results = list(pool.map(session, range(1, n + 1)))
+    errors: Dict[str, List[int]] = {}  # message -> sessions that hit it
+    for i, msg in enumerate(results, start=1):
+        if msg:
             errors.setdefault(msg, []).append(i)
     psql(f"DELETE FROM _dojo.barrier WHERE run = '{run}';")
     out = []
