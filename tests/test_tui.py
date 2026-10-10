@@ -77,6 +77,24 @@ class TuiSmokeTest(unittest.TestCase):
             await self._settle(app, pilot)
             self.assertEqual(app.current.id, 5)
 
+    def test_concurrency_lab(self):
+        asyncio.run(self._concurrency_lab())
+
+    async def _concurrency_lab(self):
+        """A Level 9 lab: checking runs the worker step in 4 concurrent sessions."""
+        q = core.get_question(58)
+        app = DojoApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await self._settle(app, pilot)
+            app.load_question(q)
+            await self._settle(app, pilot)
+            titles = [cmd.title for cmd in app.get_system_commands(app.screen)]
+            self.assertIn("Lab step: worker", titles)
+            app.query_one("#editor").load_text(q.solution_path.read_text())
+            await pilot.press("ctrl+t")
+            await self._settle(app, pilot)
+            self.assertTrue(core.is_solved(core.load_progress(), q))
+
     @staticmethod
     async def _settle(app, pilot):
         await pilot.pause(0.3)

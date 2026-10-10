@@ -133,11 +133,12 @@ Deliberately minimal: primary keys, foreign keys (constraints only) and `orders(
 Choosing the right indexes is part of the curriculum. `./dojo reset` (or *Reset objects I
 created* in the TUI) drops everything you add and returns to this baseline.
 
-## Labs (Levels 6 and 7)
+## Labs (Levels 6, 7 and 9)
 
 Lab questions create their own objects the first time you open them: Level 6 in schema **`lab`**
-(plus a few roles: `app_migrator`, `analyst`, `app_rw`, `etl`, `oncall`, `intern`), Level 7 in a
-schema per lab (`partner`, `dq`, `mart`, `supplier`, `crm`, `stream`, `archive`). Rebuild one with
+(plus a few roles: `app_migrator`, `analyst`, `app_rw`, `etl`, `oncall`, `intern`), Levels 7 and 9
+in a schema per lab (`partner`, `dq`, `mart`, `supplier`, `crm`, `stream`, `archive`; `audit`,
+`rollup`, `inbox`, `queue`, `wallet`). Rebuild one with
 *Reset this lab* (`./dojo lab-reset N`). Regenerating the dataset drops all of them.
 
 ## The lake (Level 8)

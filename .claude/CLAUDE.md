@@ -41,6 +41,8 @@ To use a database other than the compose one, set `DOJO_PSQL="psql postgresql://
   (answer = load script; `plan:` replays setup, data steps like `batch_1.sql`, and the answer twice
   per batch, then check). Labs have `setup.sql` (idempotent, own schema) and `check.sql`
   returning `(check, ok, detail)`. Lab schemas are listed in the `DROP SCHEMA` in `db/generate.sql`.
+  A plan step `parallel:<step>*<n>` (Level 9) runs `<step>.sql` in n concurrent psql sessions
+  (`core._run_parallel`); the sequential steps around it run in their own psql sessions.
 - Level 8 (`engine: duckdb`): `sqldojo/lake.py` exports Postgres into `lake/raw` via `psql COPY TO
   STDOUT` (no DuckDB extensions; extension downloads are blocked in some sandboxes) and runs
   DuckDB with the repo root as cwd. DuckDB needs `pytz` to return TIMESTAMPTZ values. The

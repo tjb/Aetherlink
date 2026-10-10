@@ -65,6 +65,7 @@ materialized views, then check again.
 | **6 · Production Postgres** ⚗ | 34 TRUNCATE blast radius · 35 Migration without TRUNCATE · 36 DELETE vs TRUNCATE on disk · 37 Fail fast with lock_timeout · 38 Privilege audit · 39 Make updates HOT |
 | **7 · Modeling & ELT** ⚗ | 40 Bulk load with COPY · 41 Data quality tests · 42 Build a star schema · 43 Sync a catalog with MERGE · 44 Slowly changing dimension · 45 Late-arriving data · 46 Partitioning and retention |
 | **8 · Lake & columnar** 🦆 | 47 Query the landing zone · 48 CSV to partitioned Parquet · 49 Row store vs column store · 50 Partition pruning · 51 Sort for zone maps · 52 Schema drift · 53 Overwrite one partition |
+| **9 · Events & concurrency** ⚗ | 54 An audit trail · 55 A rollup that keeps itself up to date · 56 An idempotent consumer · 57 A job queue with SKIP LOCKED · 58 Concurrent transfers |
 
 Along the way: join fan-out, anti-joins, three-valued logic, `FILTER`, window frames, gap filling,
 gaps-and-islands, recursive CTEs, closure tables, `LATERAL`, `GROUPING SETS`, as-of joins, interval
@@ -99,6 +100,16 @@ grader also counts **how many files your query opens**, so partition pruning is 
 You also handle schema drift, sort data for zone maps, and rewrite one partition without
 touching the others, which is the gap Iceberg and Delta Lake exist to close. The lake lives on
 your disk (not inside Docker): about 0.1 GB per unit of scale for raw, plus whatever you build.
+
+**Level 9 is about many things happening at once.** The checker opens **several sessions in
+parallel** against your code: four checkout services bumping the same counters, four consumers
+receiving the same messages, four workers pulling from one queue, four payment services moving
+money between the same wallets. Code that is correct one call at a time breaks here, and the
+checks show how: lost updates, double-processed jobs, a wallet at −50.84, `deadlock detected`.
+You write triggers (an audit trail that even catches `TRUNCATE`, a self-maintaining rollup), an
+idempotent message consumer for an at-least-once broker (dedupe tables, versioned updates, the
+transactional outbox), a job queue with `FOR UPDATE SKIP LOCKED`, and transfers that neither
+overdraw nor deadlock. Run the concurrent step yourself with `./dojo lab-step 57 worker`.
 
 Adding your own questions takes a markdown file and a SQL file: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -172,8 +183,8 @@ are excellent complements:
 
 ## Ideas for more
 
-More Production Postgres labs: isolation levels and anomalies (lost updates, write skew),
-deadlocks, `CREATE INDEX CONCURRENTLY` and invalid indexes, `NOT VALID` constraints, table
-partitioning and partition pruning, sequences and gaps, replication lag, `pg_stat_statements`
-triage. Adding one is a `question.md`, a `setup.sql`, a `check.sql` and a solution: see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+More labs: `SERIALIZABLE` and write skew (two on-call engineers both going off call), sequence
+gaps and the outbox relay that skips rows committed out of order, `CREATE INDEX CONCURRENTLY` and
+invalid indexes, `NOT VALID` constraints, change data capture from the WAL with logical decoding
+(needs `wal_level=logical`), replication lag, `pg_stat_statements` triage. Adding one is a
+`question.md`, a `setup.sql`, a `check.sql` and a solution: see [CONTRIBUTING.md](CONTRIBUTING.md).

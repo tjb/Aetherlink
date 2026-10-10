@@ -49,10 +49,15 @@ def print_question(q: core.Question) -> None:
         print(yellow(f"Lab: change the database (./dojo psql, or ./dojo run {q.id} runs your scratch file), "
                      f"then check. Start over with ./dojo lab-reset {q.id}."))
     elif q.kind == "pipeline":
-        print(yellow("Pipeline lab: check replays " + " → ".join("YOUR LOAD" if st == "answer" else st for st in q.plan)))
-        print(yellow(f"  Develop step by step: ./dojo lab-step {q.id} setup | "
-                     + " | ".join(f"./dojo lab-step {q.id} {st}" for st in q.steps[:2])
-                     + (" ..." if len(q.steps) > 2 else "") + f", then ./dojo run {q.id}"))
+        print(yellow("Pipeline lab: check replays " + " → ".join("YOUR SCRIPT" if st == "answer" else core.step_label(st)
+                                                                for st in q.plan)))
+        cmds = []
+        for st in q.plan[:-1]:
+            name = core.parallel_step(st)[0] if st.startswith("parallel:") else st
+            cmd = f"./dojo run {q.id}" if st == "answer" else f"./dojo lab-step {q.id} {name}"
+            if not cmds or cmds[-1] != cmd:
+                cmds.append(cmd)
+        print(yellow("  Develop step by step: " + " → ".join(cmds[:4]) + (" → ..." if len(cmds) > 4 else "")))
     print()
     print(q.prompt)
     print()

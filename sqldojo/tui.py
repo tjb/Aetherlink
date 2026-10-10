@@ -316,7 +316,7 @@ class DojoApp(App):
             if q.kind == "state" else
             f"[dim]Ctrl+R runs your script as yourself (superuser, autocommit). Ctrl+T runs it as "
             f"{q.run_as} and rolls back.[/dim]" if q.kind == "script" else
-            "[dim]Ctrl+R runs your load against the lab as it is now. Land data with Ctrl+P → Lab step. "
+            "[dim]Ctrl+R runs your script against the lab as it is now. Land data with Ctrl+P → Lab step. "
             "Ctrl+T replays the whole pipeline.[/dim]" if q.kind == "pipeline" else
             "[dim]Run your query with Ctrl+R (or F5).[/dim]")
         self.query_one("#check-log", RichLog).clear()
@@ -698,8 +698,10 @@ class DojoApp(App):
             yield SystemCommand("Reset this lab", f"Rebuild the lab objects for Q{self.current.code}",
                                 lambda: self.ensure_lab(self.current, force=True))
         if self.current is not None:
+            sessions = dict(core.parallel_step(st) for st in self.current.plan if st.startswith("parallel:"))
             for step in self.current.steps:
-                yield SystemCommand(f"Lab step: {step}", f"Run {step}.sql for Q{self.current.code} (lands data)",
+                how = f"in {sessions[step]} concurrent sessions" if step in sessions else "(lands data)"
+                yield SystemCommand(f"Lab step: {step}", f"Run {step}.sql for Q{self.current.code} {how}",
                                     lambda step=step: self.lab_step(self.current, step))
         yield SystemCommand("Explain (plan only)", "EXPLAIN without running the query",
                             lambda: self.action_explain(analyze=False))

@@ -49,7 +49,8 @@ DROP TABLE IF EXISTS events, reviews, order_items, orders, subscriptions,
                      product_prices, products, categories, users CASCADE;
 DROP SCHEMA IF EXISTS _dojo CASCADE;
 -- lab schemas (Levels 6+) are rebuilt on demand from the new data
-DROP SCHEMA IF EXISTS lab, partner, dq, mart, supplier, crm, stream, archive CASCADE;
+DROP SCHEMA IF EXISTS lab, partner, dq, mart, supplier, crm, stream, archive,
+                        audit, rollup, inbox, queue, wallet CASCADE;
 CREATE SCHEMA _dojo;
 
 -- Uniform [0,1) "random" number derived from a key and a salt.

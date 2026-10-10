@@ -33,6 +33,7 @@ LEVELS = {
     6: "Production Postgres",
     7: "Modeling & ELT",
     8: "Lake & columnar",
+    9: "Events & concurrency",
 }
 # kind of question:
 #   query   one SELECT, graded by comparing its result with the reference
@@ -95,7 +96,9 @@ class Question:
         self.run_as = meta.get("run_as") or None
         self.setup_path = path / "setup.sql" if (path / "setup.sql").exists() else None
         self.plan = _split_list(meta.get("plan", "setup, answer, answer, check")) if self.kind == "pipeline" else []
-        self.steps = [st for st in self.plan if st not in ("setup", "answer", "check")]
+        # data/workload steps; "parallel:worker*4" runs worker.sql in 4 concurrent sessions
+        self.steps = list(dict.fromkeys(parallel_step(st)[0] if st.startswith("parallel:") else st
+                                        for st in self.plan if st not in ("setup", "answer", "check")))
         for st in self.steps:
             if not (path / f"{st}.sql").exists():
                 raise ValueError(f"{path.name}: plan step {st!r} has no {st}.sql")
@@ -160,11 +163,28 @@ class Question:
             out.append("🧪 **Lab:** change the database however you like (the editor runs any statements), "
                        "then check.")
         elif self.kind == "pipeline":
-            out.append("🧪 **Pipeline lab:** your answer is a load script. Checking replays: "
-                       + " → ".join(f"`{st}`" if st not in ("answer",) else "**your load**" for st in self.plan))
+            out.append("🧪 **Pipeline lab:** your answer is a script. Checking replays: "
+                       + " → ".join("**your script**" if st == "answer" else f"`{step_label(st)}`"
+                                    for st in self.plan))
         out.append("")
         out.append(self.prompt)
         return "\n".join(out)
+
+
+def parallel_step(token: str) -> Tuple[str, int]:
+    """'parallel:worker*4' -> ('worker', 4)"""
+    name, _, n = token[len("parallel:"):].partition("*")
+    return name.strip(), int(n or 2)
+
+
+def step_label(step: str) -> str:
+    """How a plan step reads in the UI: 'parallel:worker*4' -> 'worker ×4 at once'."""
+    if step == "answer":
+        return "your script"
+    if step.startswith("parallel:"):
+        name, n = parallel_step(step)
+        return f"{name} ×{n} at once"
+    return step
 
 
 def _split_list(s: str) -> List[str]:
@@ -965,6 +985,13 @@ def run_lab_step(q: Question, step: str) -> str:
         return "Lab reset."
     if step not in q.steps:
         raise DojoError(f"Q{q.code} has no step {step!r}. Steps: setup, {', '.join(q.steps)}")
+    parallel = [parallel_step(t) for t in q.plan if t.startswith("parallel:")]
+    n = next((k for name, k in parallel if name == step), 0)
+    if n:
+        error = _run_parallel(q.dir / f"{step}.sql", n, DEFAULT_TIMEOUT_S)
+        if error:
+            raise QueryError(error)
+        return f"Ran {step}.sql in {n} concurrent sessions."
     return run_script((q.dir / f"{step}.sql").read_text(encoding="utf-8"))
 
 
@@ -1044,34 +1071,107 @@ def _grade_pipeline(q: Question, sql: str, check_sql: str, g: "Grade", timeout_s
     if not split_statements(sql):
         raise QueryError("no SQL found (the file only has comments)")
     session = f"SET application_name = '{APP_NAME}';\nSET statement_timeout = '{timeout_s}s';\n"
-    parts = [session, f"\\pset null '{NULL}'"]
-    runs, last_data = 0, "setup"
+    head = [session, f"\\pset null '{NULL}'"]
+    parts, runs, last_data, outputs = list(head), 0, "setup", []
+
+    def run_segment() -> bool:
+        """Run the accumulated sequential steps in one psql session."""
+        nonlocal parts
+        proc = psql("\n".join(parts) + "\n", timeout=timeout_s * max(1, runs) + 120)
+        outputs.append(proc.stdout)
+        parts = list(head)
+        if proc.returncode != 0:
+            steps = [ln[len(_STEP):] for ln in proc.stdout.splitlines() if ln.startswith(_STEP)]
+            g.error = (f"Failed during: {steps[-1]}\n" if steps else "") + _clean_error(proc)
+            return False
+        return True
+
+    if on_status:
+        on_status("Replaying the pipeline: " + " → ".join(map(step_label, q.plan)))
     for step in q.plan:
         if step == "setup":
-            parts += [f"\\echo '{_STEP}resetting the lab'", q.setup_path.read_text(encoding="utf-8"), ";",
+            parts += [f"\\echo '{_STEP}resetting the lab'", "SET client_min_messages = warning;",
+                      q.setup_path.read_text(encoding="utf-8"), ";",
                       _LABS_TABLE, f"INSERT INTO _dojo.labs VALUES ({q.id}, now()) "
-                      "ON CONFLICT (question_id) DO UPDATE SET set_up_at = now();"]
+                      "ON CONFLICT (question_id) DO UPDATE SET set_up_at = now();", "RESET client_min_messages;"]
         elif step == "answer":
             runs += 1
-            parts += [f"\\echo '{_STEP}your load, run {runs} (after {last_data})'", sql, ";",
+            parts += [f"\\echo '{_STEP}your script, run {runs} (after {last_data})'", sql, ";",
                       "RESET ALL;", session]  # your SETs don't leak into the next step
         elif step == "check":
             parts += [f"\\echo {_MARK}", "\\pset format csv", check_sql, ";"]
+        elif step.startswith("parallel:"):
+            name, n = parallel_step(step)
+            if not run_segment():
+                return
+            if on_status:
+                on_status(f"Running {n} concurrent sessions of {name}...")
+            outputs.append(f"{_STEP}{n} concurrent sessions of {name}\n")
+            error = _run_parallel(q.dir / f"{name}.sql", n, timeout_s)
+            if error:
+                g.error = f"Failed during: {name} ({n} concurrent sessions)\n{error}"
+                g.output = "".join(outputs).strip("\n")
+                return
+            last_data = name
         else:
             last_data = step
-            parts += [f"\\echo '{_STEP}landing {step}'", (q.dir / f"{step}.sql").read_text(encoding="utf-8"), ";"]
-    if on_status:
-        on_status("Replaying the pipeline: " + " → ".join("your load" if st == "answer" else st for st in q.plan))
-    proc = psql("\n".join(parts) + "\n", timeout=timeout_s * max(1, runs) + 120)
-    before, _, after = proc.stdout.partition(_MARK + "\n")
+            parts += [f"\\echo '{_STEP}running {step}'", (q.dir / f"{step}.sql").read_text(encoding="utf-8"), ";"]
+    ok = run_segment()
+    full = "".join(outputs)
+    before, _, after = full.partition(_MARK + "\n")
     g.output = before.strip("\n")
-    if proc.returncode != 0:
-        steps = [ln[len(_STEP):] for ln in proc.stdout.splitlines() if ln.startswith(_STEP)]
-        where = f"Failed during: {steps[-1]}\n" if steps else ""
-        g.error = where + _clean_error(proc)
-        return
-    g.checks = _parse_checks(after)
-    g.correct = bool(g.checks) and all(ok for _, ok, _ in g.checks)
+    if ok:
+        g.checks = _parse_checks(after)
+        g.correct = bool(g.checks) and all(ok for _, ok, _ in g.checks)
+
+
+_BARRIER_TABLE = "CREATE TABLE IF NOT EXISTS _dojo.barrier (run text NOT NULL, session int NOT NULL);"
+
+
+def _run_parallel(path: Path, n: int, timeout_s: int) -> Optional[str]:
+    """Run a step file in n concurrent psql sessions (psql variable :worker = 1..n).
+    Returns the errors, or None."""
+    run = os.urandom(8).hex()
+    # Starting a session can take a second (docker compose exec), so they wait for each other
+    # before running the step: otherwise the first one could be done before the last connects.
+    barrier = (f"SET client_min_messages = warning;\n{_BARRIER_TABLE}\n"
+               f"INSERT INTO _dojo.barrier VALUES ('{run}', :worker);\n"
+               "DO $$ BEGIN\n"
+               f"  FOR i IN 1..3000 LOOP  -- at most 30 s\n"
+               f"    EXIT WHEN (SELECT count(*) FROM _dojo.barrier WHERE run = '{run}') >= {n};\n"
+               "    PERFORM pg_sleep(0.01);\n"
+               "  END LOOP;\n"
+               "END $$;\nRESET client_min_messages;\n")
+    script = (f"SET application_name = '{APP_NAME}';\n{barrier}SET statement_timeout = '{timeout_s}s';\n"
+              + path.read_text(encoding="utf-8"))
+    procs = []
+    for i in range(1, n + 1):
+        cmd = psql_cmd() + ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-v", f"worker={i}", "-f", "-"]
+        procs.append(subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      text=True, encoding="utf-8"))
+    for proc in procs:  # start them all, then feed them, so they really overlap
+        try:
+            proc.stdin.write(script)
+            proc.stdin.close()
+        except BrokenPipeError:  # it exited already (can't connect?): its stderr says why
+            pass
+    errors: Dict[str, List[int]] = {}  # message -> sessions that hit it
+    for i, proc in enumerate(procs, start=1):
+        try:
+            _, err = proc.communicate(timeout=timeout_s + 60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            errors.setdefault("timed out", []).append(i)
+            continue
+        if proc.returncode != 0:
+            msg = re.sub(r"^psql:<stdin>:\d+: ", "", err.strip(), flags=re.M) or f"exit code {proc.returncode}"
+            errors.setdefault(msg, []).append(i)
+    psql(f"DELETE FROM _dojo.barrier WHERE run = '{run}';")
+    out = []
+    for msg, sessions in errors.items():
+        who = f"session {sessions[0]}" if len(sessions) == 1 else "sessions " + ", ".join(map(str, sessions))
+        out.append(f"{who} of {n} failed:\n{msg}")
+    return "\n".join(out) if out else None
 
 
 # --------------------------------------------------------------------------- #

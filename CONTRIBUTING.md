@@ -70,6 +70,11 @@ questions/035-my-lab/
   enforce idempotency. Give each pipeline lab its own schema and drop it in `setup.sql`, so
   helper tables the learner creates can't survive into the next run (and add the schema to the
   `DROP SCHEMA` list in `db/generate.sql`).
+  A step written `parallel:worker*4` runs `worker.sql` in 4 concurrent sessions (psql variable
+  `:worker` = 1..4; use `set_config` to pass it into a `DO` block, and `COMMIT` inside the loop
+  so the sessions really interleave). Any session failing (a deadlock, a unique violation)
+  fails the check. Make the reference solution deterministic under concurrency, and check that
+  the usual wrong answers fail (see Q057, Q058).
 - **state**: the learner changes the database however they like. `check.sql` runs on the current
   state and may use its own `BEGIN ... ROLLBACK` to try things (see Q039). `setup.sql` runs when
   the lab is first opened and on *Reset this lab*.

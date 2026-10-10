@@ -99,6 +99,13 @@ class CompareTest(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class PlanTest(unittest.TestCase):
+    def test_parallel_step(self):
+        self.assertEqual(core.parallel_step("parallel:worker*4"), ("worker", 4))
+        self.assertEqual(core.parallel_step("parallel: writers * 3"), ("writers", 3))
+        self.assertEqual(core.parallel_step("parallel:deliver"), ("deliver", 2))
+
+
 class QuestionBankTest(unittest.TestCase):
     def test_every_question_is_well_formed(self):
         qs = core.load_questions()
@@ -119,6 +126,13 @@ class QuestionBankTest(unittest.TestCase):
                     if q.kind == "script":
                         self.assertTrue(q.run_as, "script labs need run_as")
                         core.validate_script(q.solution_path.read_text())
+                    if q.kind == "pipeline":
+                        self.assertEqual(q.plan[0], "setup")
+                        self.assertEqual(q.plan[-1], "check")
+                        self.assertIn("answer, answer", ", ".join(q.plan), "run the answer twice in a row")
+                        for st in q.plan:
+                            if st.startswith("parallel:"):
+                                self.assertGreater(core.parallel_step(st)[1], 1)
                     continue
                 self.assertIn("Expected columns", q.prompt)
                 core.strip_sql(q.expected_path.read_text())  # single statement
