@@ -140,6 +140,22 @@ Lab questions create their own objects the first time you open them: Level 6 in 
 schema per lab (`partner`, `dq`, `mart`, `supplier`, `crm`, `stream`, `archive`). Rebuild one with
 *Reset this lab* (`./dojo lab-reset N`). Regenerating the dataset drops all of them.
 
+## The lake (Level 8)
+
+`./dojo lake` exports the dataset into `lake/` (gitignored, on your disk rather than in Docker):
+
+```
+lake/raw/events/day=YYYY-MM-DD/events_0.csv.gz   one gzipped CSV per day (the landing zone)
+lake/raw/{users,products,categories,orders,order_items}.csv.gz
+lake/raw/partner_orders/2025-MM.json             a partner feed whose schema changes twice in 2025
+lake/raw/corrections/bot_events_2025-11.csv      event ids to remove (Q053)
+lake/silver/, lake/gold/, lake/lab/              what you build
+lake/lake.duckdb                                 DuckDB's own database file, for views/tables you create
+```
+
+Paths in queries are relative to the repository root (`read_parquet('lake/silver/...')`).
+`./dojo lake --rebuild` re-exports after you regenerate the data, and wipes `lake/`.
+
 ## Realistic dirt
 
 Real data is messy, and so is this. Some questions depend on spotting it. If you'd rather find

@@ -77,6 +77,20 @@ questions/035-my-lab/
 - A query question can also have a `setup.sql` (for example to create roles, see Q038).
 - `./dojo selftest` checks that the solution passes *and* that doing nothing fails.
 
+## DuckDB questions (Level 8)
+
+`engine: duckdb` runs the question in DuckDB with the repository root as the working directory,
+over the files in `lake/`. Query questions work as usual (`expected.sql` should read
+`lake/raw/`, which always exists). Extras:
+
+- `max_files_read: 31` or `max_files_read: glob:lake/silver/events/month=2025-12/*.parquet`:
+  after the result is right, the grader runs `EXPLAIN ANALYZE` and fails answers that open more
+  files ("Total Files Read").
+- DuckDB labs are `kind: state` with a DuckDB `check.sql` (same `(check, ok, detail)` contract).
+  `lake_paths:` lists the files/folders the lab owns, deleted on reset. `setup.sql` (DuckDB) is
+  optional. `freeze_mtimes:` stamps the setup's files with 2026-01-01, so the check can detect
+  rewrites (`read_blob(...).last_modified`).
+
 ## Check your work
 
 ```bash

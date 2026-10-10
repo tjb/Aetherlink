@@ -7,6 +7,7 @@ import re
 import signal
 import sys
 import time
+import types
 
 from . import core
 from .core import DojoError, QueryError
@@ -196,9 +197,28 @@ def start_question(q: core.Question):
     print_question(q)
     if created:
         print(dim(f"Created answers/{q.code}.sql"))
-    if q.setup_path and core.db_meta() and not core.lab_is_set_up(q):
+    if q.engine == "duckdb" and not core.engine_ready(q):
+        print(yellow("This question runs on the data lake, which isn't built yet: ./dojo lake"))
+        return
+    if (q.setup_path or q.lake_paths) and core.db_meta() and not core.lab_is_set_up(q):
         core.setup_lab(q)
         print(dim("Lab objects created."))
+
+
+def cmd_lake(args):
+    from . import lake
+    st = lake.status()
+    if st and not args.rebuild:
+        meta = core.db_meta()
+        print(f"The lake is built: {st.get('events', 0):,} events, scale {st.get('scale')}, built {st.get('built_at')}.")
+        if meta and lake.is_stale(meta):
+            print(yellow("The database has been regenerated since. Rebuild with: ./dojo lake --rebuild"))
+        print(dim("Everything is in lake/: raw/ is the landing zone, silver/ and gold/ are yours."))
+        return
+    if st and not confirm("Rebuilding deletes everything in lake/, including your silver/ and gold/ files. Continue?",
+                          args.yes):
+        raise DojoError("aborted")
+    lake.build(print, rebuild=True)
 
 
 def cmd_lab_step(args):
@@ -211,7 +231,7 @@ def cmd_lab_step(args):
 
 def cmd_lab_reset(args):
     q = core.get_question(args.question)
-    if q.setup_path is None:
+    if q.setup_path is None and not q.lake_paths:
         raise DojoError(f"Q{q.code} has no lab to reset")
     core.require_db()
     core.setup_lab(q)
@@ -237,11 +257,14 @@ def cmd_hint(args):
 def cmd_run(args):
     q = core.get_question(args.target) if args.target.isdigit() else None
     sql = read_answer(q) if q else core.Path(args.target).read_text(encoding="utf-8")
-    core.require_db()
-    if (q and q.is_lab) or args.script:
-        print(core.run_script(sql, timeout_s=args.timeout))
+    if q is None:  # a file: pick the engine from the flag
+        q = types.SimpleNamespace(engine=args.engine, kind="query")
+    if q.engine != "duckdb":
+        core.require_db()
+    if q.kind != "query" or args.script:
+        print(core.answer_script(q, sql, timeout_s=args.timeout))
         return
-    print_table(core.run_query(sql, timeout_s=args.timeout), args.limit)
+    print_table(core.answer_query(q, sql, timeout_s=args.timeout), args.limit)
 
 
 _KIND_STYLE = {"error": red, "warn": yellow, "info": dim, "row": lambda s: "    " + s}
@@ -307,7 +330,7 @@ def cmd_explain(args):
         raise DojoError("explain works on single queries. In a lab, put EXPLAIN in your script.")
     sql = read_answer(q, args.file)
     core.require_db()
-    print(core.explain(sql, analyze=not args.no_analyze, timeout_s=args.timeout))
+    print(core.answer_explain(q, sql, analyze=not args.no_analyze, timeout_s=args.timeout))
     print(dim("Tip: paste the plan into https://explain.dalibo.com for a visual version."))
 
 
@@ -330,6 +353,10 @@ def cmd_selftest(args):
     meta = core.require_db()
     failures = 0
     only = {int(x) for x in args.only.split(",")} if args.only else None
+    if any(q.engine == "duckdb" and (not only or q.id in only) for q in core.load_questions()):
+        from . import lake
+        if not lake.status() or lake.is_stale(meta):
+            lake.build(print, rebuild=True)
     for q in core.load_questions():
         if only and q.id not in only:
             continue
@@ -370,7 +397,7 @@ def selftest_lab(q: core.Question) -> str:
         g = core.grade(q, "", record=False)
         if g.passed:
             raise DojoError("the checks pass before doing anything")
-        core.run_script(solution)
+        core.answer_script(q, solution, timeout_s=3600)
     else:
         g = core.grade(q, "SELECT 1", record=False)
         if g.passed:
@@ -452,6 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=50)
     sp.add_argument("--timeout", type=int, default=core.DEFAULT_TIMEOUT_S)
     sp.add_argument("--script", action="store_true", help="run a multi-statement script (psql output)")
+    sp.add_argument("--engine", choices=["postgres", "duckdb"], default="postgres", help="for .sql files")
     sp = add("check", cmd_check, "grade your answer")
     sp.add_argument("question")
     sp.add_argument("--file", help="answer file (default answers/NNN.sql)")
@@ -464,6 +492,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--file")
     sp.add_argument("--no-analyze", action="store_true", help="plan only, don't execute")
     sp.add_argument("--timeout", type=int, default=core.DEFAULT_TIMEOUT_S)
+    sp = add("lake", cmd_lake, "build the data lake in lake/ for Level 8 (DuckDB)")
+    sp.add_argument("--rebuild", action="store_true")
+    sp.add_argument("-y", "--yes", action="store_true")
     sp = add("lab-reset", cmd_lab_reset, "rebuild a lab's objects (Levels 6+)")
     sp.add_argument("question")
     sp = add("lab-step", cmd_lab_step, "run one step of a pipeline lab, e.g. batch_1 (Level 7)")

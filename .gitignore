@@ -10,3 +10,6 @@ __pycache__/
 .vscode/
 *.iml
 .DS_Store
+
+# Level 8 data lake (rebuild with ./dojo lake)
+lake/

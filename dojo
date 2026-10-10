@@ -18,37 +18,54 @@ def _reexec(python: Path, stage: str) -> None:
     os.execv(str(python), [str(python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
+def bootstrap_venv(what: str) -> None:
+    """Create ./.venv with requirements.txt and re-run this command inside it."""
+    stage = os.environ.get("DOJO_BOOTSTRAP", "")
+    venv = ROOT / ".venv"
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if stage == "installed":
+        sys.exit(f"{what} is still missing after installing it into .venv. Delete .venv and retry.")
+    in_venv = Path(sys.prefix).resolve() == venv.resolve()
+    if python.exists() and stage == "" and not in_venv:
+        _reexec(python, "venv")  # probably installed there already
+    try:
+        if not python.exists():
+            print(f"First run: creating .venv for {what}...")
+            subprocess.check_call([sys.executable, "-m", "venv", str(venv)])
+        print(f"Installing {what} into .venv (one time)...")
+        subprocess.check_call([str(python), "-m", "pip", "install", "--quiet",
+                               "--disable-pip-version-check", "-r", str(ROOT / "requirements.txt")])
+    except (subprocess.CalledProcessError, OSError) as e:
+        sys.exit(f"Could not set up .venv ({e}).\n"
+                 "On Debian/Ubuntu you may need: sudo apt install python3-venv")
+    _reexec(python, "installed")
+
+
 def launch_tui() -> None:
     try:
         import textual  # noqa: F401
     except ImportError:
-        stage = os.environ.get("DOJO_BOOTSTRAP", "")
-        venv = ROOT / ".venv"
-        python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        if stage == "installed":
-            sys.exit("Textual is still missing after installing it into .venv. "
-                     "Delete .venv and retry, or use the plain CLI: ./dojo help")
-        if python.exists() and stage == "":
-            _reexec(python, "venv")  # probably installed there already
-        try:
-            if not python.exists():
-                print("First run: creating .venv for the terminal UI...")
-                subprocess.check_call([sys.executable, "-m", "venv", str(venv)])
-            print("Installing Textual into .venv (one time)...")
-            subprocess.check_call([str(python), "-m", "pip", "install", "--quiet",
-                                   "--disable-pip-version-check", "-r", str(ROOT / "requirements.txt")])
-        except (subprocess.CalledProcessError, OSError) as e:
-            sys.exit(f"Could not set up the terminal UI ({e}).\n"
-                     "On Debian/Ubuntu you may need: sudo apt install python3-venv\n"
-                     "Everything also works from the plain CLI: ./dojo help")
-        _reexec(python, "installed")
+        bootstrap_venv("the terminal UI (Textual)")
     from sqldojo.tui import run
     run()
 
 
+def _prefer_venv() -> None:
+    """If ./.venv exists, run inside it (it has Textual and DuckDB; the stdlib is the same)."""
+    venv = ROOT / ".venv"
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if python.exists() and not os.environ.get("DOJO_BOOTSTRAP") and Path(sys.prefix).resolve() != venv.resolve():
+        _reexec(python, "venv")
+
+
 if __name__ == "__main__":
+    _prefer_venv()
     if not sys.argv[1:] or sys.argv[1] == "tui":
         launch_tui()
     else:
+        from sqldojo.core import NeedsDuckDB
         from sqldojo.cli import main
-        main(sys.argv[1:])
+        try:
+            main(sys.argv[1:])
+        except NeedsDuckDB:
+            bootstrap_venv("DuckDB (for the Level 8 data lake)")

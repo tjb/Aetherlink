@@ -328,17 +328,39 @@ class DojoApp(App):
         except Exception:
             pass
         self.set_status(f"answers/{q.code}.sql")
-        if q.setup_path and self.meta:
+        if self.meta and (q.engine == "duckdb" or q.setup_path or q.lake_paths):
             self.ensure_lab(q)
 
     @work(thread=True, exclusive=True, group="lab")
     def ensure_lab(self, q: core.Question, force: bool = False) -> None:
         try:
-            if force or not core.lab_is_set_up(q):
+            if q.engine == "duckdb" and not core.engine_ready(q):
+                self.build_lake_now(rebuild=False)
+            if (q.setup_path or q.lake_paths) and (force or not core.lab_is_set_up(q)):
                 core.setup_lab(q)
                 self.call_from_thread(self.notify, f"Lab for Q{q.code} is ready.")
+        except core.NeedsDuckDB:
+            self.call_from_thread(self.notify, "DuckDB isn't installed. Quit and run ./dojo lake once.",
+                                  severity="error", timeout=10)
         except DojoError as e:
             self.call_from_thread(self.notify, str(e), severity="error", timeout=10)
+
+    def build_lake_now(self, rebuild: bool) -> None:
+        """Runs in a worker thread: export Postgres into lake/raw with progress in the status bar."""
+        from . import lake
+        self.call_from_thread(self.notify, "Building the data lake in lake/ (one time; a minute or so per "
+                                           "unit of scale)...", title="Level 8", timeout=8)
+        lake.build(lambda line: self.call_from_thread(self.set_status, line.strip()), rebuild=rebuild)
+        self.call_from_thread(self.notify, "The data lake is ready.", title="Level 8")
+        if self.current is not None:
+            self.call_from_thread(self.set_status, f"answers/{self.current.code}.sql")
+
+    @work(thread=True, exclusive=True, group="lab")
+    def rebuild_lake(self) -> None:
+        try:
+            self.build_lake_now(rebuild=True)
+        except (DojoError, core.NeedsDuckDB) as e:
+            self.call_from_thread(self.notify, str(e) or "DuckDB isn't installed", severity="error", timeout=10)
 
     @work(thread=True, exclusive=True, group="db")
     def lab_step(self, q: core.Question, step: str) -> None:
@@ -414,27 +436,31 @@ class DojoApp(App):
             out = self.query_one("#script-out", RichLog)
             out.clear()
             out.write(Text("Running...", style="dim"))
-            self.run_script_worker(self.query_one("#editor", TextArea).text)
+            self.run_script_worker(self.current, self.query_one("#editor", TextArea).text)
         elif self._can_query():
             self.busy = True
             self.query_one("#bottom", TabbedContent).active = "tab-results"
             self.query_one("#results", DataTable).loading = True
-            self.run_query_worker(self.query_one("#editor", TextArea).text)
+            self.run_query_worker(self.current, self.query_one("#editor", TextArea).text)
 
     @work(thread=True, exclusive=True, group="db")
-    def run_query_worker(self, sql: str) -> None:
+    def run_query_worker(self, q: core.Question, sql: str) -> None:
         try:
-            res = core.run_query(sql)
+            res = core.answer_query(q, sql)
             self.call_from_thread(self.show_result, res, None)
         except DojoError as e:
             self.call_from_thread(self.show_result, None, str(e))
+        except core.NeedsDuckDB:
+            self.call_from_thread(self.show_result, None, "DuckDB isn't installed. Quit and run ./dojo lake once.")
 
     @work(thread=True, exclusive=True, group="db")
-    def run_script_worker(self, sql: str) -> None:
+    def run_script_worker(self, q: core.Question, sql: str) -> None:
         try:
-            output, error = core.run_script(sql), None
+            output, error = core.answer_script(q, sql), None
         except DojoError as e:
             output, error = "", str(e)
+        except core.NeedsDuckDB:
+            output, error = "", "DuckDB isn't installed. Quit and run ./dojo lake once."
         self.call_from_thread(self.show_script_output, output, error)
 
     def show_script_output(self, output: str, error: Optional[str]) -> None:
@@ -547,7 +573,7 @@ class DojoApp(App):
     def explain_worker(self, sql: str, analyze: bool) -> None:
         log = self.query_one("#plan-log", RichLog)
         try:
-            plan = core.explain(sql, analyze=analyze)
+            plan = core.answer_explain(self.current, sql, analyze=analyze)
             self.call_from_thread(log.clear)
             for line in plan.splitlines():
                 style = "bold" if "Seq Scan" in line or "Sort Method: external" in line else ""
@@ -600,7 +626,7 @@ class DojoApp(App):
     @work(thread=True, group="cancel")
     def cancel_worker(self) -> None:
         try:
-            core.cancel_queries()
+            core.cancel_all()
             self.call_from_thread(self.notify, "Cancel requested.")
         except DojoError as e:
             self.call_from_thread(self.notify, str(e), severity="error")
@@ -620,8 +646,9 @@ class DojoApp(App):
         self.set_status(f"answers/{self.current.code}.sql" if self.current else "")
         if meta:
             self.load_schema()
-            if self.current is not None and self.current.setup_path:
-                self.ensure_lab(self.current)
+            q = self.current
+            if q is not None and (q.engine == "duckdb" or q.setup_path or q.lake_paths):
+                self.ensure_lab(q)
         else:
             self.push_screen(SetupScreen(), self.setup_done)
 
@@ -663,7 +690,11 @@ class DojoApp(App):
                             lambda: self.push_screen(SetupScreen(regenerate=True), self.setup_done))
         yield SystemCommand("Reset objects I created", "Drop your indexes, views and tables",
                             self.reset_objects)
-        if self.current is not None and self.current.setup_path:
+        yield SystemCommand("Build the data lake (Level 8)", "Export the dataset into lake/ for DuckDB",
+                            lambda: self.ensure_lab(self.current) if self.current else None)
+        yield SystemCommand("Rebuild the data lake", "Re-export lake/raw from the current database (wipes lake/)",
+                            self.confirm_rebuild_lake)
+        if self.current is not None and (self.current.setup_path or self.current.lake_paths):
             yield SystemCommand("Reset this lab", f"Rebuild the lab objects for Q{self.current.code}",
                                 lambda: self.ensure_lab(self.current, force=True))
         if self.current is not None:
@@ -675,6 +706,13 @@ class DojoApp(App):
         yield SystemCommand("Next unsolved question", "Jump ahead", self.action_next)
         yield SystemCommand("Show solution", "Reference solution and explanation", self.action_solution)
         yield SystemCommand("Reload questions", "Pick up edits in questions/", self.reload_questions)
+
+    def confirm_rebuild_lake(self) -> None:
+        def answer(ok: bool) -> None:
+            if ok:
+                self.rebuild_lake()
+        self.push_screen(ConfirmScreen("Rebuild the data lake?\n\nThis deletes everything in lake/, "
+                                       "including your silver/ and gold/ files.", yes="Rebuild"), answer)
 
     def reload_questions(self) -> None:
         self.questions = core.load_questions()

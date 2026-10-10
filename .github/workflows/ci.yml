@@ -27,13 +27,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install Textual and DuckDB
+        run: pip install -r requirements.txt
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Generate a small dataset
         run: python dojo generate --scale 0.05 --yes
-      - name: Every reference solution runs and returns rows
+      - name: Build the data lake (Level 8)
+        run: python dojo lake
+      - name: Every reference solution runs (and every lab solution passes)
         run: python dojo selftest
       - name: Terminal IDE smoke test
-        run: |
-          pip install -r requirements.txt
-          python -m unittest tests/test_tui.py -v
+        run: python -m unittest tests/test_tui.py -v

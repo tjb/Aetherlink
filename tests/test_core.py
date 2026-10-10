@@ -114,7 +114,8 @@ class QuestionBankTest(unittest.TestCase):
                                 "solution.sql should start with '-- Qnnn · <title>'")
                 if q.is_lab:
                     self.assertTrue(q.check_path.exists(), "labs need check.sql")
-                    self.assertIsNotNone(q.setup_path, "labs need setup.sql")
+                    self.assertTrue(q.setup_path is not None or q.lake_paths,
+                                    "labs need setup.sql (or lake_paths for DuckDB labs)")
                     if q.kind == "script":
                         self.assertTrue(q.run_as, "script labs need run_as")
                         core.validate_script(q.solution_path.read_text())
@@ -123,6 +124,8 @@ class QuestionBankTest(unittest.TestCase):
                 core.strip_sql(q.expected_path.read_text())  # single statement
                 if q.is_perf:
                     self.assertTrue((q.dir / "expected.sql").exists(), "perf questions grade against expected.sql")
+                if q.engine == "duckdb" and q.max_files_read:
+                    self.assertTrue(q.max_files_read.isdigit() or q.max_files_read.startswith("glob:lake/"))
 
 
 if __name__ == "__main__":

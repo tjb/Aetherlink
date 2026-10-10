@@ -32,6 +32,7 @@ LEVELS = {
     5: "Performance",
     6: "Production Postgres",
     7: "Modeling & ELT",
+    8: "Lake & columnar",
 }
 # kind of question:
 #   query   one SELECT, graded by comparing its result with the reference
@@ -58,6 +59,11 @@ class QueryError(DojoError):
     """A query failed: syntax error, timeout, missing table, ..."""
 
 
+class NeedsDuckDB(Exception):
+    """Raised when a Level 8 (DuckDB) feature is used and the duckdb package isn't installed.
+    The ./dojo launcher catches it, installs duckdb into .venv and retries."""
+
+
 # --------------------------------------------------------------------------- #
 # Questions
 # --------------------------------------------------------------------------- #
@@ -76,6 +82,14 @@ class Question:
         self.target_scaling = meta.get("target_scaling", "constant")
         self.prompt, self.hints = _split_hints(body)
         self.kind = meta.get("kind", "query")
+        self.engine = meta.get("engine", "postgres")  # postgres | duckdb
+        # duckdb questions: an int, or "glob:<pattern>" = at most as many files as match
+        self.max_files_read = meta.get("max_files_read") or None
+        # duckdb labs: files/folders under lake/ that the lab owns (deleted when it resets)
+        self.lake_paths = _split_list(meta.get("lake_paths", ""))
+        # duckdb labs: after setup, stamp these files with a fixed old mtime (2026-01-01), so a
+        # check can tell whether the learner rewrote them
+        self.freeze_mtimes = _split_list(meta.get("freeze_mtimes", ""))
         if self.kind not in KINDS:
             raise ValueError(f"{path.name}: unknown kind {self.kind!r}")
         self.run_as = meta.get("run_as") or None
@@ -133,7 +147,10 @@ class Question:
             out.append(f"# Q{self.code} · {self.title}\n")
         out.append(f"**Level {self.level} · {self.level_name}** · {', '.join(self.topics)}  ")
         if self.tables:
-            out.append("Tables: " + ", ".join(f"`{t}`" for t in self.tables) + "  ")
+            label = "Files" if self.engine == "duckdb" else "Tables"
+            out.append(f"{label}: " + ", ".join(f"`{t}`" for t in self.tables) + "  ")
+        if self.engine == "duckdb":
+            out.append("🦆 **Runs in DuckDB** over the files in `lake/` (not in Postgres)  ")
         if self.is_perf:
             out.append(f"⏱ **Performance target: {self.target_label()}**")
         if self.kind == "script":
@@ -760,7 +777,8 @@ def compare(expected: Result, actual: Result, q: Question) -> Tuple[bool, List[T
 def reference_result(q: Question, meta: dict, refresh: bool = False,
                      on_status: Optional[Callable[[str], None]] = None) -> Result:
     sql = q.expected_path.read_text(encoding="utf-8")
-    key = hashlib.sha256("|".join([sql, meta.get("scale", ""), meta.get("generated_at", "")])
+    stamp = (_lake().require_lake().get("built_at", "") if q.engine == "duckdb" else "")
+    key = hashlib.sha256("|".join([sql, meta.get("scale", ""), meta.get("generated_at", ""), stamp])
                          .encode()).hexdigest()[:16]
     path = CACHE_DIR / f"{q.code}-{key}.json"
     if path.exists() and not refresh:
@@ -768,7 +786,7 @@ def reference_result(q: Question, meta: dict, refresh: bool = False,
     if on_status:
         on_status("Computing the reference answer (cached after the first run)...")
     try:
-        res = run_query(sql, timeout_s=3600)
+        res = answer_query(q, sql, timeout_s=3600)
     except QueryError as e:
         raise DojoError(f"the reference solution failed (please report this):\n{e}")
     CACHE_DIR.mkdir(exist_ok=True)
@@ -805,6 +823,14 @@ def grade(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S,
     """Run the answer, compare with the reference, update progress (unless record=False)."""
     meta = require_db()
     g = Grade(target_ms=q.target_for_scale(float(meta.get("scale", 1))))
+    if q.is_lab and q.engine == "duckdb":
+        try:
+            _grade_duck_lab(q, g, on_status)
+        except QueryError as e:
+            g.error = str(e)
+        if record:
+            _record_attempt(q, g)
+        return g
     if q.is_lab:
         try:
             _grade_lab(q, sql, g, timeout_s, on_status)
@@ -821,7 +847,7 @@ def grade(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S,
         for i in range(runs):
             if on_status:
                 on_status("Running your query" + (f" ({i + 1}/{runs})" if runs > 1 else "") + "...")
-            g.actual = run_query(sql, timeout_s=timeout_s)
+            g.actual = answer_query(q, sql, timeout_s=timeout_s)
             g.timings.append(g.actual.ms)
             if i == 0:
                 g.correct, g.messages = compare(g.expected, g.actual, q)
@@ -829,6 +855,17 @@ def grade(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S,
                     break  # wrong, or hopelessly slow: no point in re-running
         g.best_ms = min(g.timings)
         g.fast_enough = g.target_ms is None or g.best_ms <= g.target_ms
+        if g.correct and q.engine == "duckdb" and q.max_files_read:
+            limit = (_lake().count_files(q.max_files_read[5:]) if q.max_files_read.startswith("glob:")
+                     else int(q.max_files_read))
+            n = _lake().files_read(sql, timeout_s=timeout_s)
+            if n > limit:
+                g.correct = False
+                g.messages.append(("error", f"Right answer, but your query read {n} files and should read at "
+                                            f"most {limit}. Filter on the partition column so DuckDB can skip "
+                                            "whole files (see EXPLAIN: \"Total Files Read\")."))
+            else:
+                g.messages.append(("info", f"Files read: {n} (limit {limit})."))
     except QueryError as e:
         g.error = str(e)
         g.correct = False
@@ -852,12 +889,52 @@ def _record_attempt(q: Question, g: Grade) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Engine dispatch (Postgres via psql, or DuckDB over ./lake for Level 8)
+# --------------------------------------------------------------------------- #
+def _lake():
+    from . import lake
+    return lake
+
+
+def answer_query(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S) -> Result:
+    return _lake().run_query(sql, timeout_s) if q.engine == "duckdb" else run_query(sql, timeout_s)
+
+
+def answer_script(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S) -> str:
+    return _lake().run_script(sql, timeout_s) if q.engine == "duckdb" else run_script(sql, timeout_s)
+
+
+def answer_explain(q: Question, sql: str, analyze: bool = True, timeout_s: int = DEFAULT_TIMEOUT_S) -> str:
+    if q.engine == "duckdb":
+        return _lake().explain(sql, analyze, timeout_s)
+    return explain(sql, analyze, timeout_s)
+
+
+def cancel_all() -> None:
+    try:
+        cancel_queries()
+    except DojoError:
+        pass
+    try:
+        _lake().cancel()
+    except Exception:
+        pass
+
+
+def engine_ready(q: Question) -> bool:
+    """For DuckDB questions: is the lake built?"""
+    return q.engine != "duckdb" or bool(_lake().status())
+
+
+# --------------------------------------------------------------------------- #
 # Labs
 # --------------------------------------------------------------------------- #
 _LABS_TABLE = "CREATE TABLE IF NOT EXISTS _dojo.labs (question_id int PRIMARY KEY, set_up_at timestamptz NOT NULL);"
 
 
 def lab_is_set_up(q: Question) -> bool:
+    if q.engine == "duckdb":
+        return _lake().lab_is_set_up(q)
     if q.setup_path is None:
         return True
     try:
@@ -869,6 +946,9 @@ def lab_is_set_up(q: Question) -> bool:
 
 def setup_lab(q: Question) -> None:
     """(Re)create the lab's objects. Idempotent; resets any work done in a state lab."""
+    if q.engine == "duckdb":
+        _lake().setup_lab(q)
+        return
     if q.setup_path is None:
         return
     proc = psql(q.setup_path.read_text(encoding="utf-8") + f"\n{_LABS_TABLE}\n"
@@ -938,6 +1018,21 @@ def _grade_lab(q: Question, sql: str, g: "Grade", timeout_s: int,
     before, _, after = proc.stdout.partition(_MARK + "\n")
     g.output = before.strip("\n")
     g.checks = _parse_checks(after)
+    g.correct = bool(g.checks) and all(ok for _, ok, _ in g.checks)
+
+
+def _grade_duck_lab(q: Question, g: "Grade", on_status: Optional[Callable[[str], None]]) -> None:
+    lake = _lake()
+    lake.require_lake()
+    if not lake.lab_is_set_up(q):
+        if on_status:
+            on_status("Setting up the lab...")
+        lake.setup_lab(q)
+        g.error = "The lab wasn't set up yet, so it has just been created for you. Do the task, then check again."
+        return
+    if on_status:
+        on_status("Checking the files in lake/ ...")
+    g.checks = lake.run_checks(q.check_path.read_text(encoding="utf-8"))
     g.correct = bool(g.checks) and all(ok for _, ok, _ in g.checks)
 
 

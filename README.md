@@ -28,7 +28,7 @@ git clone <this repo> sql-dojo && cd sql-dojo
 ./dojo
 ```
 
-The first run installs the terminal UI into `./.venv`, starts Postgres 17 in Docker and generates
+The first run installs the terminal UI (and DuckDB, for Level 8) into `./.venv`, starts Postgres 17 in Docker and generates
 the dataset (pick a scale; 1 is a good start). Bigger scales need free space *inside Docker*: about
 12 GB for scale 10. Docker Desktop has its own disk limit, separate from your computer's free space
 (*Settings → Resources → Advanced*); `./dojo` checks before generating. Then:
@@ -64,6 +64,7 @@ materialized views, then check again.
 | **5 · Performance** ⏱ | 30 Latest activity per user · 31 Make it sargable · 32 Precompute monthly actives · 33 Events before purchase |
 | **6 · Production Postgres** ⚗ | 34 TRUNCATE blast radius · 35 Migration without TRUNCATE · 36 DELETE vs TRUNCATE on disk · 37 Fail fast with lock_timeout · 38 Privilege audit · 39 Make updates HOT |
 | **7 · Modeling & ELT** ⚗ | 40 Bulk load with COPY · 41 Data quality tests · 42 Build a star schema · 43 Sync a catalog with MERGE · 44 Slowly changing dimension · 45 Late-arriving data · 46 Partitioning and retention |
+| **8 · Lake & columnar** 🦆 | 47 Query the landing zone · 48 CSV to partitioned Parquet · 49 Row store vs column store · 50 Partition pruning · 51 Sort for zone maps · 52 Schema drift · 53 Overwrite one partition |
 
 Along the way: join fan-out, anti-joins, three-valued logic, `FILTER`, window frames, gap filling,
 gaps-and-islands, recursive CTEs, closure tables, `LATERAL`, `GROUPING SETS`, as-of joins, interval
@@ -88,6 +89,16 @@ supplier catalogue with `MERGE` (soft deletes included), keep a type-2 slowly ch
 dimension, maintain an incremental rollup while late data arrives, and manage retention with
 partitions. While developing, run the steps yourself: *Lab step* in the command palette, or
 `./dojo lab-step 45 batch_1`.
+
+**Level 8 leaves Postgres for the data lake.** `./dojo lake` (or opening a Level 8 question)
+exports the dataset as files into `lake/raw/`: one gzipped CSV per day, a partner's JSON feed,
+dimension tables. Your queries then run in [DuckDB](https://duckdb.org), in-process and straight
+over the files. You build a Parquet silver layer, then see why columnar formats win at analytics
+(the same MAU query: seconds in Postgres, milliseconds here) and why file layout matters. The
+grader also counts **how many files your query opens**, so partition pruning is graded for real.
+You also handle schema drift, sort data for zone maps, and rewrite one partition without
+touching the others, which is the gap Iceberg and Delta Lake exist to close. The lake lives on
+your disk (not inside Docker): about 0.1 GB per unit of scale for raw, plus whatever you build.
 
 Adding your own questions takes a markdown file and a SQL file: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -118,6 +129,7 @@ Everything the TUI does is also a command, using only Python's standard library:
 ./dojo reset                drop the indexes, views and tables you created
 ./dojo lab-reset 36         rebuild a lab's objects and start it over
 ./dojo lab-step 45 batch_1  pipeline labs: land the next batch of data by hand
+./dojo lake [--rebuild]     Level 8: export the dataset into lake/ for DuckDB
 ./dojo down | destroy       stop the container / delete it and its data
 ```
 
@@ -155,8 +167,8 @@ are excellent complements:
   query performance. Read it alongside Level 5.
 - **[BigQuery public datasets](https://cloud.google.com/bigquery/public-data)**: real big data
   (GitHub, Stack Overflow, NYC taxis), 1 TB of free queries a month.
-- **[DuckDB](https://duckdb.org)**: try the same questions on a columnar engine and compare
-  (`ATTACH 'host=localhost port=5433 dbname=dojo user=dojo password=dojo' AS dojo (TYPE postgres);`).
+- **[DuckDB](https://duckdb.org)** (used in Level 8): also try the Postgres-level questions in it
+  (`ATTACH 'host=localhost port=5433 dbname=dojo user=dojo password=dojo' AS pg (TYPE postgres);`).
 
 ## Ideas for more
 

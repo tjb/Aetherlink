@@ -41,6 +41,11 @@ To use a database other than the compose one, set `DOJO_PSQL="psql postgresql://
   (answer = load script; `plan:` replays setup, data steps like `batch_1.sql`, and the answer twice
   per batch, then check). Labs have `setup.sql` (idempotent, own schema) and `check.sql`
   returning `(check, ok, detail)`. Lab schemas are listed in the `DROP SCHEMA` in `db/generate.sql`.
+- Level 8 (`engine: duckdb`): `sqldojo/lake.py` exports Postgres into `lake/raw` via `psql COPY TO
+  STDOUT` (no DuckDB extensions; extension downloads are blocked in some sandboxes) and runs
+  DuckDB with the repo root as cwd. DuckDB needs `pytz` to return TIMESTAMPTZ values. The
+  launcher installs requirements into `.venv` when `core.NeedsDuckDB` is raised. Computing
+  per-row date functions on TIMESTAMPTZ is slow in DuckDB; prefer hive partition columns.
 - `answers/`: the learner's work and `progress.json`. Never commit test answers or progress here.
 - `.github/workflows/`: CI (unit tests + generate at scale 0.05 + selftest + TUI smoke test) and an
   optional daily-question issue workflow (schedule commented out by default; also closes solved issues).
