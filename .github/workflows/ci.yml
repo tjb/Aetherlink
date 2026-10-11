@@ -4,6 +4,7 @@ name: CI
 # plus unit tests and a headless smoke test of the terminal IDE.
 on:
   push:
+    paths-ignore: ["answers/**"]
   pull_request:
   workflow_dispatch:
 

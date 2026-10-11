@@ -502,7 +502,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-y", "--yes", action="store_true")
     sp = add("lab-reset", cmd_lab_reset, "rebuild a lab's objects (Levels 6+)")
     sp.add_argument("question")
-    sp = add("lab-step", cmd_lab_step, "run one step of a pipeline lab, e.g. batch_1 (Level 7)")
+    sp = add("lab-step", cmd_lab_step, "run one step of a lab's checker, e.g. batch_1 (Levels 7 and 9)")
     sp.add_argument("question")
     sp.add_argument("step")
     sp = add("reset", cmd_reset, "drop indexes/views/tables you created")

@@ -3,7 +3,7 @@
 A question is a directory under `questions/` named `NNN-short-slug/`:
 
 ```
-questions/034-my-question/
+questions/059-my-question/
 ├── question.md     the problem (front matter + markdown + hints)
 ├── solution.sql    the reference solution, with an explanation in comments
 └── expected.sql    optional: grade against this query instead of solution.sql
@@ -13,7 +13,7 @@ questions/034-my-question/
 
 ```markdown
 ---
-id: 34
+id: 59
 title: Short title (fits the sidebar, under ~32 characters)
 level: 3
 topics: comma, separated, concepts
@@ -48,14 +48,14 @@ Put the original slow (but correct) query in `expected.sql`. It's what grading c
 so it must finish in reasonable time *without* any extra indexes. `solution.sql` lists the setup
 (`CREATE INDEX ...`) in comments, followed by the fast query.
 
-## Labs (`kind: script` / `kind: state`)
+## Labs (`kind: script` / `state` / `pipeline`)
 
 Labs are graded by inspecting the database instead of comparing a result:
 
 ```
-questions/035-my-lab/
+questions/060-my-lab/
 ├── question.md     front matter adds `kind: script` (and `run_as: some_role`) or `kind: state`
-├── setup.sql       idempotent: (re)creates the lab's objects in schema `lab`, plus any roles
+├── setup.sql       idempotent: (re)creates the lab's objects in its own schema, plus any roles
 ├── check.sql       returns rows (check text, ok boolean, detail text). All ok = solved
 └── solution.sql    a script that passes the checks, with the explanation in comments
 ```

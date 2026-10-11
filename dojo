@@ -28,6 +28,12 @@ def bootstrap_venv(what: str) -> None:
     in_venv = Path(sys.prefix).resolve() == venv.resolve()
     if python.exists() and stage == "" and not in_venv:
         _reexec(python, "venv")  # probably installed there already
+    if sys.version_info < (3, 10):  # what Textual's and DuckDB's pinned versions need
+        have, needs = ".".join(map(str, sys.version_info[:3])), what[0].upper() + what[1:]
+        sys.exit(f"{needs} needs Python 3.10 or newer, and this is Python {have} ({sys.executable}).\n"
+                 "Install a newer one (macOS: brew install python, or python.org), then run SQL Dojo with it,\n"
+                 "for example: python3.13 dojo"
+                 + ("\nDelete the old .venv folder first: rm -rf .venv" if python.exists() else ""))
     try:
         if not python.exists():
             print(f"First run: creating .venv for {what}...")
