@@ -13,3 +13,4 @@ __pycache__/
 
 # Level 8 data lake (rebuild with ./dojo lake)
 lake/
+answers/scratch/

@@ -99,6 +99,109 @@ class CompareTest(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class StatementAtTest(unittest.TestCase):
+    TEXT = ("-- users\nSELECT * FROM users LIMIT 5;\n\n"
+            "-- statuses\nSELECT status, count(*)\nFROM orders\nGROUP BY 1;\n\n"
+            "SELECT 'a;b' AS x, $$;$$ AS y, \"we;ird\" AS z;\n")
+
+    def at(self, needle, after=0):
+        """The statement when the cursor sits just before `needle` (+ after characters)."""
+        return core.statement_at(self.TEXT, self.TEXT.index(needle) + after)
+
+    def test_cursor_inside_a_statement(self):
+        self.assertEqual(self.at("FROM orders"), ("SELECT status, count(*)\nFROM orders\nGROUP BY 1;", 5))
+
+    def test_cursor_right_after_the_semicolon_runs_that_statement(self):
+        self.assertEqual(self.at("LIMIT 5;", after=8)[0], "SELECT * FROM users LIMIT 5;")
+
+    def test_blank_line_belongs_to_the_statement_above(self):
+        blank = self.TEXT.index(";\n\n-- statuses") + 2
+        self.assertEqual(core.statement_at(self.TEXT, blank)[0], "SELECT * FROM users LIMIT 5;")
+
+    def test_comment_line_belongs_to_the_statement_below(self):
+        self.assertEqual(self.at("-- statuses")[1], 5)
+        self.assertEqual(self.at("-- users")[1], 2)
+
+    def test_semicolons_inside_strings_and_dollar_quotes(self):
+        self.assertEqual(self.at("'a;b'")[0], "SELECT 'a;b' AS x, $$;$$ AS y, \"we;ird\" AS z;")
+
+    def test_end_of_text_and_a_final_statement_without_semicolon(self):
+        self.assertEqual(core.statement_at(self.TEXT, len(self.TEXT))[1], 9)
+        self.assertEqual(core.statement_at("SELECT 1;\nSELECT 2", 15), ("SELECT 2", 2))
+
+    def test_cursor_after_the_semicolon_with_a_trailing_comment_or_spaces(self):
+        self.assertEqual(core.statement_at("SELECT 1; -- one row\nSELECT 2;\n", 20), ("SELECT 1;", 1))
+        self.assertEqual(core.statement_at("SELECT 1;  \r\nSELECT 2;\n", 11), ("SELECT 1;", 1))
+
+    def test_escape_strings(self):
+        sql = "SELECT E'it\\'s; fine' AS a;\nSELECT 2 AS b;\n"
+        self.assertEqual(core.statement_at(sql, 3), ("SELECT E'it\\'s; fine' AS a;", 1))
+        self.assertEqual(core.split_statements(sql), ["SELECT E'it\\'s; fine' AS a", "SELECT 2 AS b"])
+        # a plain string ending in a backslash is not an escape
+        self.assertEqual(core.split_statements("SELECT 'a\\'; SELECT 1"), ["SELECT 'a\\'", "SELECT 1"])
+
+    def test_nothing_to_run(self):
+        self.assertIsNone(core.statement_at("-- just a comment\n\n", 3))
+        self.assertIsNone(core.statement_at("", 0))
+
+
+class ScratchTest(unittest.TestCase):
+    def test_plain_queries_are_capped(self):
+        for sql in ("SELECT * FROM events", "with x as (select 1) select * from x", "TABLE users",
+                    "(SELECT 1) UNION (SELECT 2)", "VALUES (1), (2)",
+                    "SELECT * FROM orders WHERE status = 'update' AND note = 'insert into'"):
+            with self.subTest(sql=sql):
+                wrapped, ok = core.limit_rows(sql, 1000)
+                self.assertTrue(ok)
+                self.assertTrue(wrapped.startswith("WITH scratch AS MATERIALIZED ("))  # keeps the plan
+                self.assertTrue(wrapped.endswith("LIMIT 1001"))
+
+    def test_writes_are_left_alone(self):
+        for sql in ("INSERT INTO t VALUES (1)", "SELECT * INTO t2 FROM t", "EXPLAIN SELECT 1",
+                    "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", "SET work_mem = '1GB'"):
+            with self.subTest(sql=sql):
+                self.assertEqual(core.limit_rows(sql, 1000), (sql, False))
+
+    def test_session_statements_are_refused(self):
+        """Each Scratch query runs on its own: BEGIN/SET would silently not carry over."""
+        q = core.get_question(31)
+        for sql in ("BEGIN", "rollback;", "SET work_mem = '1GB'", "LOCK orders", "-- note\nSAVEPOINT a"):
+            with self.subTest(sql=sql), self.assertRaises(core.QueryError):
+                core.scratch_query(q, sql)
+
+    def test_read_only_only_on_plain_postgres_questions(self):
+        self.assertTrue(core.scratch_is_read_only(core.get_question(1)))
+        self.assertFalse(core.scratch_is_read_only(core.get_question(30)))  # performance: make indexes
+        self.assertFalse(core.scratch_is_read_only(core.get_question(35)))  # lab
+        self.assertFalse(core.scratch_is_read_only(core.get_question(47)))  # DuckDB
+
+    def test_peek_sql(self):
+        self.assertEqual(core.ident('we"ird'), '"we""ird"')
+        small = core.peek_column_sql("orders", "status", "text", (5, 0.0), 450_000)[0]
+        self.assertIn("GROUP BY 1\nORDER BY 2 DESC, 1", small)  # by position: a column named rows is fine
+        self.assertIn("LIMIT 201", small)  # one more than shown, to tell when there are more
+        self.assertNotIn("TABLESAMPLE", small)
+        big = core.peek_column_sql("events", "event_type", "text", (6, 0.0), 29_000_000)[0]
+        self.assertIn("TABLESAMPLE SYSTEM", big)
+        self.assertIn("approx_rows", big)
+        many, what = core.peek_column_sql("users", "signup_at", "timestamp with time zone", (-1, 0.0), 500_000)
+        self.assertIn('min("signup_at") AS min', many)
+        self.assertIn("count(DISTINCT", many)  # exact on small tables, not the planner's guess
+        self.assertIn("exact", what)
+        sampled, what = core.peek_column_sql("events", "occurred_at", "timestamp(3) with time zone",
+                                             (-0.9, 0.0), 29_000_000)
+        self.assertIn("AS sample_min", sampled)
+        self.assertNotIn("DISTINCT", sampled)
+        self.assertIn("of the sample", what)
+        self.assertNotIn("min(", core.peek_column_sql("t", "flag", "boolean", None, None)[0])
+        self.assertNotIn("min(", core.peek_column_sql("t", "during", "daterange", (-1, 0.0), 1000)[0])
+        # n_distinct as a fraction of the rows: 25 of 82 is few values
+        self.assertIn("GROUP BY 1", core.peek_column_sql("categories", "parent_id", "integer", (-0.3049, 0.0), 82)[0])
+        keys = core.peek_column_sql("events", "properties", "jsonb", (-0.1, 0.0), 29_000_000)[0]
+        self.assertIn("LEFT JOIN LATERAL jsonb_object_keys", keys)  # arrays and scalars still show up
+        self.assertIn("AS k(key)", keys)
+
+
 class PlanTest(unittest.TestCase):
     def test_parallel_step(self):
         self.assertEqual(core.parallel_step("parallel:worker*4"), ("worker", 4))

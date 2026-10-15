@@ -11,11 +11,12 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 QUESTIONS_DIR = ROOT / "questions"
@@ -118,6 +119,10 @@ class Question:
     @property
     def answer_path(self) -> Path:
         return ANSWERS_DIR / f"{self.code}.sql"
+
+    @property
+    def scratch_path(self) -> Path:
+        return ANSWERS_DIR / "scratch" / f"{self.code}.sql"
 
     @property
     def level_name(self) -> str:
@@ -357,7 +362,13 @@ def mark_solution_viewed(q: Question) -> None:
 def _skip_quoted(text: str, i: int) -> int:
     """Given text[i] is a quote char, return the index just past the closing quote."""
     ch, j, n = text[i], i + 1, len(text)
+    # E'...' strings: a backslash escapes the next character (E'it\'s')
+    escapes = (ch == "'" and i > 0 and text[i - 1] in "eE"
+               and (i < 2 or not (text[i - 2].isalnum() or text[i - 2] in "_$")))
     while j < n:
+        if escapes and text[j] == "\\":
+            j += 2
+            continue
         if text[j] == ch:
             if j + 1 < n and text[j + 1] == ch:
                 j += 2
@@ -474,6 +485,75 @@ def _has_top_level_semicolon(text: str) -> bool:
     return False
 
 
+def statement_spans(sql: str) -> List[Tuple[int, int]]:
+    """(start, end) of each statement in the text as written: start is its first character of SQL
+    (leading comments excluded), end is just past its ';' (or its last character)."""
+    spans, i, n, start, last = [], 0, len(sql), None, None
+    while i < n:
+        ch = sql[i]
+        if sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        if sql.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if sql.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            continue
+        if ch.isspace():
+            i += 1
+            continue
+        if start is None:
+            start = i
+        if ch == ";":
+            spans.append((start, i + 1))
+            start = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            i = _skip_quoted(sql, i)
+        elif ch == "$" and _dollar_tag(sql, i):
+            tag = _dollar_tag(sql, i)
+            j = sql.find(tag, i + len(tag))
+            i = n if j == -1 else j + len(tag)
+        else:
+            i += 1
+        last = i
+    if start is not None:
+        spans.append((start, last))
+    return spans
+
+
+def statement_at(sql: str, offset: int) -> Optional[Tuple[str, int]]:
+    """The statement under the cursor (offset into sql) and the line it starts on (1-based).
+
+    Between statements, a blank line belongs to the statement above it, and a comment line to the
+    statement below it (comments usually describe what follows)."""
+    spans = [(a, b) for a, b in statement_spans(sql) if sql[a:b].strip(" \t\r\n;")]
+    if not spans:
+        return None
+    pick = next((sp for sp in spans if sp[0] <= offset <= sp[1]), None)
+    if pick is None:
+        before = [sp for sp in spans if sp[1] <= offset]
+        after = [sp for sp in spans if sp[0] > offset]
+        line_start = sql.rfind("\n", 0, offset) + 1
+        line_end = sql.find("\n", offset)
+        blank_line = not sql[line_start:len(sql) if line_end == -1 else line_end].strip()
+        if before and "\n" not in sql[before[-1][1]:offset]:
+            pick = before[-1]  # after its ';' on the same line (trailing spaces or a comment)
+        elif blank_line:
+            pick = before[-1] if before else after[0]
+        else:
+            pick = after[0] if after else before[-1]
+    a, b = pick
+    return sql[a:b], sql.count("\n", 0, a) + 1
+
+
 # --------------------------------------------------------------------------- #
 # Talking to Postgres (through psql, so there are no Python dependencies)
 # --------------------------------------------------------------------------- #
@@ -482,6 +562,7 @@ class Result:
     header: List[str]
     rows: List[List[str]]
     ms: float
+    truncated: bool = False  # more rows existed than were fetched (scratch queries)
 
     def to_json(self) -> dict:
         return {"header": self.header, "rows": self.rows, "ms": self.ms}
@@ -542,22 +623,27 @@ def run_query(sql: str, timeout_s: int = DEFAULT_TIMEOUT_S) -> Result:
         raise QueryError(err)
     out = proc.stdout
     times = [float(t) for t in _TIME_RE.findall(out)]
+    csv.field_size_limit(sys.maxsize)
     rows = list(csv.reader(io.StringIO(_TIME_RE.sub("", out).strip("\n"))))
     if not rows:
         raise QueryError("the statement returned no result set (is it a SELECT?)")
     return Result(rows[0], rows[1:], times[-1] if times else 0.0)
 
 
-def explain(sql: str, analyze: bool = True, timeout_s: int = DEFAULT_TIMEOUT_S) -> str:
+def explain(sql: str, analyze: bool = True, timeout_s: int = DEFAULT_TIMEOUT_S, read_only: bool = False) -> str:
     body = strip_sql(sql)
     if not body:
         raise QueryError("no SQL found (the file only has comments)")
     opts = "ANALYZE, BUFFERS" if analyze else "COSTS"
     proc = psql(f"SET application_name = '{APP_NAME}';\n"
                 f"SET statement_timeout = '{timeout_s}s';\n"
-                f"EXPLAIN ({opts}) {body};\n", timeout=timeout_s + 30)
+                + ("SET default_transaction_read_only = on;\n" if read_only else "")
+                + f"EXPLAIN ({opts}) {body};\n", timeout=timeout_s + 30)
     if proc.returncode != 0:
-        raise QueryError(_clean_error(proc))
+        err = _clean_error(proc)
+        if read_only and "read-only transaction" in err:
+            err += _READ_ONLY_HELP
+        raise QueryError(err)
     return proc.stdout.rstrip()
 
 
@@ -586,6 +672,194 @@ def cancel_queries() -> None:
     """Cancel any running dojo query (used by the TUI's Esc key)."""
     psql(f"SELECT pg_cancel_backend(pid) FROM pg_stat_activity "
          f"WHERE application_name = '{APP_NAME}' AND pid <> pg_backend_pid();", timeout=15)
+
+
+# --------------------------------------------------------------------------- #
+# Scratch queries and peeking at tables (the TUI's Scratch tab and Schema tab)
+# --------------------------------------------------------------------------- #
+SCRATCH_ROWS = 1000
+_WRAPPABLE = re.compile(r"^(\(\s*)*(SELECT|WITH|VALUES|TABLE)\b", re.I)
+_WRITES = re.compile(r"\b(INSERT|UPDATE|DELETE|MERGE|INTO)\b", re.I)
+_READ_ONLY_HELP = ("\nScratch is read-only on this question, so an experiment can't damage the dataset.\n"
+                   "To try an index or a view, use ./dojo psql (Ctrl+P → Reset objects I created drops them\n"
+                   "again). Changed rows (INSERT/UPDATE/DELETE) can only be undone by regenerating the data.")
+# Scratch runs each statement in its own autocommit session: these would silently do nothing
+_SESSION_ONLY = re.compile(r"^(BEGIN|START\s+TRANSACTION|COMMIT|END|ABORT|ROLLBACK|SAVEPOINT|RELEASE|"
+                           r"PREPARE\s+TRANSACTION|SET|RESET|LOCK|DISCARD|LISTEN|UNLISTEN)\b", re.I)
+
+
+def _blank_literals(sql: str) -> str:
+    """The SQL with string literals and quoted identifiers blanked out (for keyword checks)."""
+    out, i, n = [], 0, len(sql)
+    while i < n:
+        if sql[i] in ("'", '"'):
+            j = _skip_quoted(sql, i)
+            out.append(" " * (j - i))
+            i = j
+        else:
+            out.append(sql[i])
+            i += 1
+    return "".join(out)
+
+
+def limit_rows(body: str, limit: int) -> Tuple[str, bool]:
+    """Wrap a plain query so at most limit + 1 rows come back: SELECT * FROM events must not ship
+    millions of rows to the screen. A MATERIALIZED CTE (not a subquery) because a CTE is planned
+    for full retrieval: the plan and the timing stay what Check would see, while the outer LIMIT
+    still stops reading early. Statements that write (or SELECT INTO) are left alone."""
+    code = _blank_literals(body)
+    if _WRAPPABLE.match(code) and not _WRITES.search(code):
+        return f"WITH scratch AS MATERIALIZED (\n{body}\n)\nSELECT * FROM scratch LIMIT {limit + 1}", True
+    return body, False
+
+
+def run_scratch(sql: str, read_only: bool, limit: int = SCRATCH_ROWS,
+                timeout_s: int = DEFAULT_TIMEOUT_S) -> Result:
+    """Run one exploratory statement. Returns its rows (at most `limit`), or no columns if the
+    statement doesn't return rows. With read_only, anything that writes fails."""
+    body = strip_sql(sql)
+    if not body:
+        raise QueryError("no SQL found (only comments)")
+    if body.startswith("\\"):
+        raise QueryError("psql commands like \\d don't work here. Press Enter on a table in the Schema tab "
+                         "to see its rows, or use ./dojo psql.")
+    stmt, wrapped = limit_rows(body, limit)
+    script = (f"SET application_name = '{APP_NAME}';\n"
+              f"SET statement_timeout = '{timeout_s}s';\n"
+              + ("SET default_transaction_read_only = on;\n" if read_only else "")
+              + f"\\pset null '{NULL}'\n\\timing on\n{stmt}\n;\n")
+    proc = psql(script, extra_args=["--csv"], timeout=timeout_s + 30)
+    if proc.returncode != 0:
+        err = _clean_error(proc)
+        if "statement timeout" in err:
+            err += f"\n(the query ran for more than {timeout_s}s)"
+        elif "canceling statement due to user request" in err:
+            err = "Cancelled."
+        elif read_only and "read-only transaction" in err:
+            err += _READ_ONLY_HELP
+        raise QueryError(err)
+    times = [float(t) for t in _TIME_RE.findall(proc.stdout)]
+    out = re.sub(r"^Time: [\d.]+ ms.*\n?", "", proc.stdout, flags=re.M)
+    csv.field_size_limit(sys.maxsize)
+    # an empty line is a row holding one empty string (single-column results), not "no row"
+    rows = [r or [""] for r in csv.reader(io.StringIO(out))]
+    ms = times[-1] if times else 0.0
+    if not rows or not out:
+        return Result([], [], ms)
+    return Result(rows[0], rows[1:limit + 1], ms, len(rows) - 1 > limit)
+
+
+def ident(name: str) -> str:
+    """A quoted SQL identifier."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+_ORDERABLE = {"smallint", "integer", "bigint", "numeric", "real", "double precision", "text", "character",
+              "character varying", "date", "interval", "time without time zone", "time with time zone",
+              "timestamp without time zone", "timestamp with time zone"}
+_COMPARABLE = _ORDERABLE | {"boolean", "uuid", "jsonb", "inet"}
+_FEW_VALUES = 200
+_EXACT_UP_TO = 1_000_000   # rows; bigger tables are sampled so a peek stays quick
+_SAMPLE_ROWS = 300_000
+
+
+def _base_type(typ: str) -> str:
+    """'numeric(10,2)' -> 'numeric'; 'timestamp(3) with time zone' -> 'timestamp with time zone'."""
+    return " ".join(re.sub(r"\([^)]*\)", "", typ).split())
+
+
+def table_estimate(table: str) -> Optional[int]:
+    """The planner's row estimate for a table (instant; None for views or before ANALYZE)."""
+    rows = query_rows(f"SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass({_literal(ident(table))});")
+    n = int(rows[0][0]) if rows and rows[0] and rows[0][0].lstrip("-").isdigit() else -1
+    return n if n >= 0 else None
+
+
+def primary_key(table: str) -> List[str]:
+    """The table's primary key columns, in order (empty if it has none)."""
+    return [r[0] for r in query_rows(
+        f"SELECT a.attname FROM pg_index i "
+        f"JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey) "
+        f"WHERE i.indrelid = to_regclass({_literal(ident(table))}) AND i.indisprimary "
+        f"ORDER BY array_position(i.indkey::int2[], a.attnum);")]
+
+
+def peek_table_sql(table: str, limit: int = 100, order_by: Sequence[str] = ()) -> str:
+    order = f"\nORDER BY {', '.join(map(ident, order_by))}" if order_by else ""
+    return f"SELECT *\nFROM {ident(table)}{order}\nLIMIT {limit}"
+
+
+def column_stats(table: str, column: str) -> Optional[Tuple[float, float]]:
+    """(n_distinct, null_frac) from the planner's statistics, if the table has been analyzed."""
+    rows = query_rows(f"SELECT n_distinct, null_frac FROM pg_stats WHERE schemaname = 'public' "
+                      f"AND tablename = {_literal(table)} AND attname = {_literal(column)};")
+    if not rows or len(rows[0]) < 2:
+        return None
+    return float(rows[0][0]), float(rows[0][1])
+
+
+def peek_column_sql(table: str, column: str, typ: str, stats: Optional[Tuple[float, float]],
+                    estimate: Optional[int]) -> Tuple[str, str]:
+    """(sql, what it shows). A column with few distinct values (by the planner's statistics) gets its
+    values with their counts, most common first; a jsonb column the keys inside it; any other column
+    a one-row summary. Tables over a million rows are read through a repeatable random sample of
+    about 300,000 rows (TABLESAMPLE), so their numbers are estimates."""
+    t, c, base = ident(table), ident(column), _base_type(typ)
+    sampled = estimate is not None and estimate > _EXACT_UP_TO
+    if sampled:
+        pct = float(f"{100.0 * _SAMPLE_ROWS / estimate:.2g}")
+        source = f"{t} TABLESAMPLE SYSTEM ({pct:g}) REPEATABLE (1)"
+        how = f"estimated from a {pct:g}% sample of about {estimate:,} rows"
+        count = f"round(count(*) * 100 / {pct:g}) AS approx_rows"
+    else:
+        source, how, count = t, "exact", "count(*) AS rows"
+    n_distinct = stats[0] if stats else 0
+    distinct = -n_distinct * estimate if n_distinct < 0 and estimate else n_distinct
+    if 0 < distinct <= _FEW_VALUES and n_distinct != -1:  # -1: every value is different
+        return (f"SELECT {c}, {count},\n"
+                f"       round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct\n"
+                f"FROM {source}\nGROUP BY 1\nORDER BY 2 DESC, 1\nLIMIT {_FEW_VALUES + 1}",
+                f"its values with their counts, most common first ({how})")
+    if base == "jsonb":  # what's inside: which keys, how often (and what the non-objects are)
+        tc = f"{t}.{c}"  # qualified: the column itself may be called key
+        return (f"SELECT coalesce(k.key, '(' || coalesce(jsonb_typeof({tc}), 'null') || ')') AS key, {count}\n"
+                f"FROM {source}\n"
+                f"LEFT JOIN LATERAL jsonb_object_keys(CASE WHEN jsonb_typeof({tc}) = 'object' THEN {tc} END)"
+                f" AS k(key) ON true\n"
+                f"GROUP BY 1\nORDER BY 2 DESC, 1\nLIMIT {_FEW_VALUES + 1}",
+                f"the keys inside the JSON, with how many rows have each ({how})")
+    cols = ["count(*) AS sampled_rows" if sampled else "count(*) AS rows",
+            f"round(100.0 * (count(*) - count({c})) / greatest(count(*), 1), 1) AS null_pct"]
+    if not sampled and base in _COMPARABLE:
+        cols.append(f"count(DISTINCT {c}) AS distinct_values")
+    if base in _ORDERABLE:
+        pre = "sample_" if sampled else ""
+        cols += [f"min({c}) AS {pre}min", f"max({c}) AS {pre}max"]
+    if sampled and base in _ORDERABLE:
+        how += "; min and max of the sample, not of the whole table"
+    return "SELECT " + ",\n       ".join(cols) + f"\nFROM {source}", f"a summary ({how})"
+
+
+def run_peek(table: str, column: Optional[str] = None, typ: str = "", limit: int = 100,
+             timeout_s: int = DEFAULT_TIMEOUT_S) -> Tuple[Result, str, str]:
+    """Look at a table's first rows or at one column's values: (rows, the SQL, what it shows)."""
+    estimate = table_estimate(table)
+    if column:
+        sql, what = peek_column_sql(table, column, typ, column_stats(table, column), estimate)
+        res = run_scratch(sql, read_only=True, timeout_s=timeout_s)
+        if len(res.rows) > _FEW_VALUES:  # it asked for one more than it shows: there are more values
+            res = Result(res.header, res.rows[:_FEW_VALUES], res.ms, True)
+        return res, sql, f"{table}.{column}: {what}"
+    key = primary_key(table)
+    sql = peek_table_sql(table, limit, key)
+    res = run_scratch(sql, read_only=True, timeout_s=timeout_s)
+    total = f" of about {estimate:,}" if estimate is not None else ""
+    order = f"the first by {', '.join(key)}" if key else "in no particular order"
+    return res, sql, f"{table}: {len(res.rows):,} rows{total}, {order}"
 
 
 def db_meta() -> Dict[str, str]:
@@ -929,6 +1203,28 @@ def answer_explain(q: Question, sql: str, analyze: bool = True, timeout_s: int =
     if q.engine == "duckdb":
         return _lake().explain(sql, analyze, timeout_s)
     return explain(sql, analyze, timeout_s)
+
+
+def scratch_is_read_only(q: Question) -> bool:
+    """Scratch can't write on plain query questions; labs and performance questions need writes."""
+    return q.kind == "query" and not q.is_perf and q.engine == "postgres"
+
+
+def scratch_query(q: Question, sql: str, timeout_s: int = DEFAULT_TIMEOUT_S) -> Result:
+    m = _SESSION_ONLY.match(strip_sql(sql))
+    if m:
+        raise QueryError(f"Scratch runs every query on its own, with autocommit, so {m.group(1).upper()} "
+                         "wouldn't carry over to the next one (a DELETE after BEGIN would be committed).\n"
+                         "For BEGIN ... ROLLBACK experiments or SET, use ./dojo psql.")
+    if q.engine == "duckdb":
+        return _lake().run_scratch(sql, SCRATCH_ROWS, timeout_s)
+    return run_scratch(sql, scratch_is_read_only(q), SCRATCH_ROWS, timeout_s)
+
+
+def scratch_explain(q: Question, sql: str, analyze: bool = True, timeout_s: int = DEFAULT_TIMEOUT_S) -> str:
+    if q.engine == "duckdb":
+        return _lake().explain(sql, analyze, timeout_s)
+    return explain(sql, analyze, timeout_s, read_only=scratch_is_read_only(q))
 
 
 def cancel_all() -> None:

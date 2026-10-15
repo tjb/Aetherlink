@@ -22,13 +22,20 @@ MAX_GRID_ROWS = 1000
 HELP = """\
 # SQL Dojo
 
-Pick a question on the left, write **one query** in the editor, and check it.
+Pick a question on the left, write **one query** in the Answer tab, and check it.
 Your answer is saved automatically to `answers/NNN.sql`.
+
+The **Scratch** tab (`F2` switches) is for exploring: write as many queries as you like, end each
+with `;`, and `Ctrl+R` runs the one under the cursor (or the text you selected). Scratch is never
+graded, is saved to `answers/scratch/NNN.sql`, and shows up to 1,000 rows. On ordinary questions it's
+**read-only**, so an experiment can't damage the dataset. Each query runs on its own (autocommit):
+for `BEGIN ... ROLLBACK` or `SET`, use `./dojo psql`.
 
 | Keys | |
 |---|---|
-| `Ctrl+R` / `F5` | **Run** the query and show the result |
-| `Ctrl+T` / `F6` | **Check** it against the reference answer |
+| `Ctrl+R` / `F5` | **Run** your answer (in Scratch: the query under the cursor) |
+| `F2` | Switch between the **Answer** and **Scratch** tabs |
+| `Ctrl+T` / `F6` | **Check** your answer against the reference (from either tab) |
 | `Ctrl+E` / `F7` | **Explain**: `EXPLAIN (ANALYZE, BUFFERS)` your query |
 | `Ctrl+G` / `F8` | Reveal the next **hint** |
 | `Ctrl+O` / `F9` | Show the reference **solution** and explanation |
@@ -38,7 +45,9 @@ Your answer is saved automatically to `answers/NNN.sql`.
 | `Tab` / `Shift+Tab` | Move between panes |
 | `Ctrl+Q` | Quit |
 
-**Schema tab** (left): browse tables and columns. Select a column to insert its name.
+**Schema tab** (left): `Enter` on a table shows its first 100 rows. `Enter` on a column shows its
+values with their counts, most common first (or a summary when there are too many values; tables
+over a million rows are sampled, and the label says so). `i` inserts the name into the editor.
 
 **Labs** (⚗, Level 6): `Ctrl+R` runs every statement in the editor (autocommit, as the
 superuser, with psql's output). `Ctrl+T` checks the database state. In *script* labs it runs your
@@ -51,6 +60,16 @@ Undo everything with *Reset objects I created* in the command palette.
 
 Press `Esc` to close.
 """
+
+
+class SchemaTree(Tree):
+    """Tables and columns. Enter peeks at the data; i inserts the name into the editor."""
+    BINDINGS = [Binding("i", "insert_name", "Insert name")]
+
+    def action_insert_name(self) -> None:
+        node = self.cursor_node
+        if node is not None and node.data:
+            self.app.insert_name(node.data)
 
 
 class HelpScreen(ModalScreen[None]):
@@ -175,7 +194,8 @@ class DojoApp(App):
     #schema { height: 1fr; }
     #main { width: 1fr; }
     #question-scroll { height: 2fr; min-height: 6; padding: 0 1; border-bottom: tall $panel; }
-    #editor { height: 3fr; min-height: 6; border: none; }
+    #editors { height: 3fr; min-height: 6; }
+    #editor, #scratch { height: 1fr; border: none; }
     #status { height: 1; padding: 0 1; background: $panel; color: $text-muted; }
     #bottom { height: 2fr; min-height: 8; }
     #result-info { height: auto; padding: 0 1; }
@@ -204,6 +224,7 @@ class DojoApp(App):
         Binding("ctrl+g", "hint", "Hint", priority=True),
         Binding("ctrl+o", "solution", "Solution", priority=True),
         Binding("ctrl+n", "next", "Next", priority=True),
+        Binding("f2", "toggle_scratch", "Scratch"),
         Binding("f1", "help", "Help"),
         # F-key aliases (the editor uses F5-F7 itself, hence priority)
         Binding("f5", "run", show=False, priority=True),
@@ -221,6 +242,7 @@ class DojoApp(App):
         self.current: Optional[core.Question] = None
         self.meta: Dict[str, str] = {}
         self._save_timer = None
+        self._scratch_timer = None
         self._loading_text = False
         self.busy = False
 
@@ -230,11 +252,15 @@ class DojoApp(App):
         with Horizontal():
             with TabbedContent("Questions", "Schema", id="sidebar"):
                 yield OptionList(id="questions")
-                yield Tree("tables", id="schema")
+                yield SchemaTree("tables", id="schema")
             with Vertical(id="main"):
                 with VerticalScroll(id="question-scroll"):
                     yield Markdown(id="question-md")
-                yield TextArea.code_editor("", language="sql", theme="vscode_dark", id="editor")
+                with TabbedContent(id="editors"):
+                    with TabPane("Answer", id="tab-answer"):
+                        yield TextArea.code_editor("", language="sql", theme="vscode_dark", id="editor")
+                    with TabPane("Scratch", id="tab-scratch"):
+                        yield TextArea.code_editor("", language="sql", theme="vscode_dark", id="scratch")
                 yield Static("", id="status")
                 with TabbedContent(id="bottom"):
                     with TabPane("Results", id="tab-results"):
@@ -261,7 +287,7 @@ class DojoApp(App):
                 note = (f"Picking up where you left off: Q{first.code}" if first.id == last
                         else f"Q{last:03d} is done. Next up: Q{first.code}")
                 self.notify(note, title="Welcome back")
-        self.query_one("#editor").focus()
+        self.active_editor().focus()
         self.check_database()
 
     # ------------------------------------------------------------ questions
@@ -295,15 +321,17 @@ class DojoApp(App):
     def question_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option.id:
             self.load_question(core.get_question(event.option.id[1:]))
-            self.query_one("#editor").focus()
+            self.active_editor().focus()
 
     def load_question(self, q: core.Question) -> None:
         self.save_answer()
+        self.save_scratch()
         self.current = q
         core.ensure_stub(q)
         core.remember_question(q)
         self._loading_text = True
         self.query_one("#editor", TextArea).load_text(q.answer_path.read_text(encoding="utf-8"))
+        self.query_one("#scratch", TextArea).load_text(self.scratch_text(q))
         self.query_one("#question-md", Markdown).update(q.markdown())
         self.query_one("#question-scroll").scroll_home(animate=False)
         self.render_hints()
@@ -311,14 +339,7 @@ class DojoApp(App):
         self.query_one("#results").display = not q.is_lab
         self.query_one("#script-out", RichLog).clear()
         self.query_one("#script-out").display = q.is_lab
-        self.query_one("#result-info", Static).update(
-            "[dim]Ctrl+R runs every statement in the editor (autocommit, as the superuser).[/dim]"
-            if q.kind == "state" else
-            f"[dim]Ctrl+R runs your script as yourself (superuser, autocommit). Ctrl+T runs it as "
-            f"{q.run_as} and rolls back.[/dim]" if q.kind == "script" else
-            "[dim]Ctrl+R runs your script against the lab as it is now. Land data with Ctrl+P → Lab step. "
-            "Ctrl+T replays the whole pipeline.[/dim]" if q.kind == "pipeline" else
-            "[dim]Run your query with Ctrl+R (or F5).[/dim]")
+        self.query_one("#result-info", Static).update(self.intro_text(q))
         self.query_one("#check-log", RichLog).clear()
         self.query_one("#plan-log", RichLog).clear()
         self.query_one("#bottom", TabbedContent).active = "tab-results"
@@ -330,6 +351,19 @@ class DojoApp(App):
         self.set_status(f"answers/{q.code}.sql")
         if self.meta and (q.engine == "duckdb" or q.setup_path or q.lake_paths):
             self.ensure_lab(q)
+
+    @staticmethod
+    def intro_text(q: core.Question) -> str:
+        """What Ctrl+R does on this question (shown above the results)."""
+        if q.kind == "state":
+            return "[dim]Ctrl+R runs every statement in the editor (autocommit, as the superuser).[/dim]"
+        if q.kind == "script":
+            return (f"[dim]Ctrl+R runs your script as yourself (superuser, autocommit). Ctrl+T runs it as "
+                    f"{q.run_as} and rolls back.[/dim]")
+        if q.kind == "pipeline":
+            return ("[dim]Ctrl+R runs your script against the lab as it is now. Land data with Ctrl+P → Lab step. "
+                    "Ctrl+T replays the whole pipeline.[/dim]")
+        return "[dim]Run your query with Ctrl+R (or F5).[/dim]"
 
     @work(thread=True, exclusive=True, group="lab")
     def ensure_lab(self, q: core.Question, force: bool = False) -> None:
@@ -412,8 +446,87 @@ class DojoApp(App):
         if not path.exists() or path.read_text(encoding="utf-8") != text:
             path.write_text(text, encoding="utf-8")
 
+    def scratch_text(self, q: core.Question) -> str:
+        if q.scratch_path.exists():
+            return q.scratch_path.read_text(encoding="utf-8")
+        return self.scratch_starter(q)
+
+    @staticmethod
+    def scratch_starter(q: core.Question) -> str:
+        lines = [f"-- Scratch for Q{q.code} · {q.title}. Never graded: explore freely.",
+                 "-- Ctrl+R runs the query under the cursor (or the selected text). End each query with ;"]
+        if core.scratch_is_read_only(q):
+            lines.append("-- Read-only on this question, so experiments can't change the data.")
+        lines.append("-- Schema tab (left): Enter on a table shows its rows, on a column its values.")
+        example = q.tables[0] if q.tables else ""
+        if example and all(part.isidentifier() for part in example.split(".")):
+            lines += ["", f"SELECT * FROM {example} LIMIT 10;"]
+        return "\n".join(lines) + "\n"
+
+    @on(TextArea.Changed, "#scratch")
+    def scratch_changed(self) -> None:
+        if self._scratch_timer:
+            self._scratch_timer.stop()
+        self._scratch_timer = self.set_timer(0.8, self.save_scratch)
+
+    def save_scratch(self) -> None:
+        """Save Scratch once it differs from what's on disk (or, for a new file, from the starter)."""
+        q = self.current
+        if q is None:
+            return
+        try:
+            text = self.query_one("#scratch", TextArea).text
+        except NoMatches:  # shutting down
+            return
+        path = q.scratch_path
+        before = path.read_text(encoding="utf-8") if path.exists() else self.scratch_starter(q)
+        if text != before:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+
+    def in_scratch(self) -> bool:
+        return self.query_one("#editors", TabbedContent).active == "tab-scratch"
+
+    def active_editor(self) -> TextArea:
+        return self.query_one("#scratch" if self.in_scratch() else "#editor", TextArea)
+
+    def action_toggle_scratch(self) -> None:
+        tabs = self.query_one("#editors", TabbedContent)
+        tabs.active = "tab-answer" if tabs.active == "tab-scratch" else "tab-scratch"
+        self.active_editor().focus()
+
+    @on(TabbedContent.TabActivated, "#editors")
+    def editor_tab_changed(self) -> None:
+        if self.current is not None:
+            self.set_status(f"answers/scratch/{self.current.code}.sql (never graded)" if self.in_scratch()
+                            else f"answers/{self.current.code}.sql")
+
+    def scratch_statement(self) -> Optional[tuple]:
+        """(sql, first line) of the selection, or of the statement under the cursor."""
+        ed = self.query_one("#scratch", TextArea)
+        selected = ed.selected_text
+        if selected.strip():
+            if len(core.split_statements(selected)) > 1:
+                self.notify("The selection holds several statements. Select one, or put the cursor in it.",
+                            severity="warning")
+                return None
+            start = min(ed.selection.start, ed.selection.end)
+            return selected, start[0] + 1
+        offset = ed.document.get_index_from_location(ed.cursor_location)
+        found = core.statement_at(ed.text, offset)
+        if found is None:
+            self.notify("Nothing to run: write a query in Scratch first.", severity="warning")
+        return found
+
+    def insert_name(self, data: dict) -> None:
+        name = data.get("column") or data.get("table")
+        editor = self.active_editor()
+        editor.insert(name)
+        editor.focus()
+
     def action_save(self) -> None:
         self.save_answer()
+        self.save_scratch()
         self.notify(f"Saved answers/{self.current.code}.sql" if self.current else "Nothing to save")
 
     def _can_query(self) -> bool:
@@ -430,10 +543,16 @@ class DojoApp(App):
 
     # --------------------------------------------------------------- actions
     def action_run(self) -> None:
+        if self.in_scratch():
+            self.run_scratch()
+            return
         if self._can_query() and self.current.is_lab:
             self.busy = True
             self.query_one("#bottom", TabbedContent).active = "tab-results"
+            self.query_one("#results", DataTable).display = False
+            self.query_one("#result-info", Static).update(self.intro_text(self.current))
             out = self.query_one("#script-out", RichLog)
+            out.display = True
             out.clear()
             out.write(Text("Running...", style="dim"))
             self.run_script_worker(self.current, self.query_one("#editor", TextArea).text)
@@ -442,6 +561,59 @@ class DojoApp(App):
             self.query_one("#bottom", TabbedContent).active = "tab-results"
             self.query_one("#results", DataTable).loading = True
             self.run_query_worker(self.current, self.query_one("#editor", TextArea).text)
+
+    def run_scratch(self) -> None:
+        if not self._can_query():
+            return
+        self.save_scratch()
+        found = self.scratch_statement()
+        if found is None:
+            return
+        sql, line = found
+        self.busy = True
+        self.query_one("#bottom", TabbedContent).active = "tab-results"
+        self.query_one("#results", DataTable).display = True
+        self.query_one("#script-out").display = False
+        self.query_one("#results", DataTable).loading = True
+        mode = " · read-only" if core.scratch_is_read_only(self.current) else ""
+        self.scratch_worker(self.current, sql, f"Scratch · line {line}{mode}")
+
+    @work(thread=True, exclusive=True, group="db")
+    def scratch_worker(self, q: core.Question, sql: str, label: str) -> None:
+        try:
+            res = core.scratch_query(q, sql)
+            self.call_from_thread(self.show_result, res, None, label)
+        except DojoError as e:
+            self.call_from_thread(self.show_result, None, str(e), label)
+        except core.NeedsDuckDB:
+            self.call_from_thread(self.show_result, None, "DuckDB isn't installed. Quit and run ./dojo lake once.")
+        except Exception as e:  # never let an odd result take the whole IDE down
+            self.call_from_thread(self.show_result, None, f"{type(e).__name__}: {e}", label)
+
+    # ------------------------------------------------------------- peeking
+    @on(Tree.NodeSelected, "#schema")
+    def schema_selected(self, event: Tree.NodeSelected) -> None:
+        if event.node.allow_expand and not event.node.is_expanded:
+            return  # that was a collapse: keep the results you were reading
+        if event.node.data and self._can_query():
+            self.busy = True
+            self.query_one("#bottom", TabbedContent).active = "tab-results"
+            self.query_one("#results", DataTable).display = True
+            self.query_one("#script-out").display = False
+            self.query_one("#results", DataTable).loading = True
+            self.peek_worker(dict(event.node.data))
+
+    @work(thread=True, exclusive=True, group="db")
+    def peek_worker(self, data: dict) -> None:
+        table, column = data["table"], data.get("column")
+        name = f"{table}.{column}" if column else table
+        self.call_from_thread(self.query_one("#result-info", Static).update, Text(f"Reading {name}...", style="dim"))
+        try:
+            res, sql, label = core.run_peek(table, column, data.get("type", ""))
+            self.call_from_thread(self.show_result, res, None, label, sql)
+        except Exception as e:  # never let an odd column take the whole IDE down
+            msg = str(e) if isinstance(e, DojoError) else f"{type(e).__name__}: {e}"
+            self.call_from_thread(self.show_result, None, msg, name)
 
     @work(thread=True, exclusive=True, group="db")
     def run_query_worker(self, q: core.Question, sql: str) -> None:
@@ -465,7 +637,11 @@ class DojoApp(App):
 
     def show_script_output(self, output: str, error: Optional[str]) -> None:
         self.busy = False
+        self.query_one("#results", DataTable).display = False
+        if self.current is not None:
+            self.query_one("#result-info", Static).update(self.intro_text(self.current))
         out = self.query_one("#script-out", RichLog)
+        out.display = True
         out.clear()
         for line in (error or output or "(no output)").splitlines():
             if error or line.startswith(("ERROR", "FATAL")):
@@ -476,20 +652,42 @@ class DojoApp(App):
                 style = ""
             out.write(Text(line, style=style))
 
-    def show_result(self, res: Optional[core.Result], error: Optional[str]) -> None:
+    def show_result(self, res: Optional[core.Result], error: Optional[str], label: Optional[str] = None,
+                    sql: Optional[str] = None) -> None:
+        """Show rows in the grid. label says where they came from (Scratch, a peek); sql is shown
+        under it so you can copy it into Scratch and tweak it."""
         self.busy = False
         table = self.query_one("#results", DataTable)
         table.loading = False
+        table.display = True
+        self.query_one("#script-out").display = False
         info = self.query_one("#result-info", Static)
         table.clear(columns=True)
+        line = Text()
+        if label:
+            line.append(f"{label}  ", style="bold cyan")
         if error:
-            info.update(Text(error, style="red"))
+            line.append(error, style="red")
+            info.update(line)
             return
-        table.add_columns(*res.header)
+        if not res.header:
+            line.append(f"Done in {core.fmt_ms(res.ms)} (the statement returned no rows).", style="dim")
+            info.update(line)
+            return
+        table.add_columns(*[Text(h) for h in res.header])
         for row in res.rows[:MAX_GRID_ROWS]:
-            table.add_row(*[Text("NULL", style="dim italic") if v == core.NULL else v for v in row])
-        more = f" (showing the first {MAX_GRID_ROWS})" if len(res.rows) > MAX_GRID_ROWS else ""
-        info.update(f"[b]{len(res.rows):,}[/b] rows{more} in [b]{core.fmt_ms(res.ms)}[/b]")
+            table.add_row(*[Text("NULL", style="dim italic") if v == core.NULL else Text(v) for v in row])
+        if res.truncated:
+            more = f" (the first {len(res.rows):,}; there are more)"
+        elif len(res.rows) > MAX_GRID_ROWS:
+            more = f" (showing the first {MAX_GRID_ROWS})"
+        else:
+            more = ""
+        line.append_text(Text.from_markup(f"[b]{len(res.rows):,}[/b] rows{more} in [b]{core.fmt_ms(res.ms)}[/b]"))
+        if sql:  # one line, cut to the pane's width, so it never squeezes the grid
+            flat, width = " ".join(sql.split()), max(info.content_size.width, 20)
+            line.append("\n" + (flat if len(flat) <= width else flat[:width - 1] + "…"), style="dim")
+        info.update(line)
 
     def action_check(self) -> None:
         if self._can_query():
@@ -558,6 +756,18 @@ class DojoApp(App):
         self.refresh_question_list()
 
     def action_explain(self, analyze: bool = True) -> None:
+        if self.in_scratch():
+            if self._can_query():
+                found = self.scratch_statement()
+                if found is None:
+                    return
+                self.busy = True
+                log = self.query_one("#plan-log", RichLog)
+                log.clear()
+                log.write(Text(f"EXPLAIN (Scratch, line {found[1]})...", style="dim"))
+                self.query_one("#bottom", TabbedContent).active = "tab-plan"
+                self.explain_worker(found[0], analyze, scratch=True)
+            return
         if self.current is not None and self.current.is_lab:
             self.notify("Explain works on single queries. In a lab, put EXPLAIN in the editor and run it.")
             return
@@ -570,10 +780,13 @@ class DojoApp(App):
             self.explain_worker(self.query_one("#editor", TextArea).text, analyze)
 
     @work(thread=True, exclusive=True, group="db")
-    def explain_worker(self, sql: str, analyze: bool) -> None:
+    def explain_worker(self, sql: str, analyze: bool, scratch: bool = False) -> None:
         log = self.query_one("#plan-log", RichLog)
         try:
-            plan = core.answer_explain(self.current, sql, analyze=analyze)
+            if scratch:
+                plan = core.scratch_explain(self.current, sql, analyze=analyze)
+            else:
+                plan = core.answer_explain(self.current, sql, analyze=analyze)
             self.call_from_thread(log.clear)
             for line in plan.splitlines():
                 style = "bold" if "Seq Scan" in line or "Sort Method: external" in line else ""
@@ -615,7 +828,7 @@ class DojoApp(App):
         for q in self.questions[start:] + self.questions[:start]:
             if not core.is_solved(progress, q):
                 self.load_question(q)
-                self.query_one("#editor").focus()
+                self.active_editor().focus()
                 return
         self.notify("Every question is solved. 🎉", title="Done")
 
@@ -671,16 +884,10 @@ class DojoApp(App):
         nodes = {}
         for table, column, typ in cols:
             if table not in nodes:
-                nodes[table] = tree.root.add(Text(table, style="bold"), data=table, expand=False)
-            nodes[table].add_leaf(Text.assemble(column, "  ", (typ, "dim")), data=column)
+                nodes[table] = tree.root.add(Text(table, style="bold"), data={"table": table}, expand=False)
+            nodes[table].add_leaf(Text.assemble(column, "  ", (typ, "dim")),
+                                  data={"table": table, "column": column, "type": typ})
         tree.root.expand()
-
-    @on(Tree.NodeSelected, "#schema")
-    def schema_selected(self, event: Tree.NodeSelected) -> None:
-        if not event.node.children and event.node.data:
-            editor = self.query_one("#editor", TextArea)
-            editor.insert(str(event.node.data))
-            editor.focus()
 
     def get_system_commands(self, screen):
         yield from super().get_system_commands(screen)
@@ -738,6 +945,7 @@ class DojoApp(App):
 
     async def action_quit(self) -> None:
         self.save_answer()
+        self.save_scratch()
         self.exit()
 
 

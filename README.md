@@ -60,7 +60,8 @@ In the IDE:
 
 | Key | |
 |---|---|
-| `Ctrl+R` / `F5` | Run your query and show the result |
+| `Ctrl+R` / `F5` | Run your answer and show the result (in Scratch: the query under the cursor) |
+| `F2` | Switch between the **Answer** and **Scratch** tabs |
 | `Ctrl+T` / `F6` | Check it against the reference answer |
 | `Ctrl+E` / `F7` | `EXPLAIN (ANALYZE, BUFFERS)` your query |
 | `Ctrl+G` / `F8` | Next hint |
@@ -70,6 +71,15 @@ In the IDE:
 | `Ctrl+P` | Command palette: start/regenerate the database, reset indexes, explain without running, ... |
 | `F1` | Help |
 | `Ctrl+Q` | Quit |
+
+**Explore as you go.** The **Scratch** tab (`F2`) holds as many queries as you like and is never
+graded: `Ctrl+R` runs the one under the cursor (or the text you selected) and shows up to 1,000
+rows. On ordinary questions it's read-only, so an experiment can't damage the data. Each query runs
+on its own (for `BEGIN ... ROLLBACK` or `SET`, use `./dojo psql`). In the **Schema** tab, `Enter` on
+a table shows its first rows, and `Enter` on a column shows its values with their counts, most
+common first (for `orders.status`: delivered, returned, cancelled, shipped, pending), or a summary
+when there are too many values. Tables over a million rows are sampled, so a peek takes a second,
+not a minute.
 
 **Rather use your own editor or SQL client?** Answers are plain files (`answers/007.sql`): edit
 them anywhere and grade them with `./dojo check 7`. See [the plain CLI](#the-plain-cli) for the
@@ -150,6 +160,7 @@ the first time it needs it:
 ./dojo today                pick up where you left off (or the next unsolved question)
 ./dojo start 7              open question 7 and create answers/007.sql
 ./dojo show 7               print a question
+./dojo peek orders.status   a table's first rows, or a column's values (peek users)
 ./dojo run 7                run your answer, print the result
 ./dojo check 7              grade it
 ./dojo hint 7               reveal one more hint

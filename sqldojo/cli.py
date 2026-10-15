@@ -272,6 +272,26 @@ def cmd_run(args):
     print_table(core.answer_query(q, sql, timeout_s=args.timeout), args.limit)
 
 
+def cmd_peek(args):
+    """Look at a table's rows, or a column's values, without writing a query."""
+    core.require_db()
+    table, _, column = args.target.partition(".")
+    cols = {(t, c): typ for t, c, typ in core.schema()}
+    if not any(t == table for t, _ in cols):
+        raise DojoError(f"no table {table!r}. ./dojo peek with one of: "
+                        + ", ".join(sorted({t for t, _ in cols})))
+    if column and (table, column) not in cols:
+        raise DojoError(f"{table} has no column {column!r}. Columns: "
+                        + ", ".join(c for t, c in cols if t == table))
+    res, sql, label = core.run_peek(table, column or None, cols.get((table, column), ""), args.limit,
+                                    timeout_s=args.timeout)
+    print(bold(cyan(label)))
+    print(dim(sql))
+    print_table(res, len(res.rows))
+    if res.truncated:
+        print(dim("(there are more values than these)"))
+
+
 _KIND_STYLE = {"error": red, "warn": yellow, "info": dim, "row": lambda s: "    " + s}
 
 
@@ -485,6 +505,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--timeout", type=int, default=core.DEFAULT_TIMEOUT_S)
     sp.add_argument("--script", action="store_true", help="run a multi-statement script (psql output)")
     sp.add_argument("--engine", choices=["postgres", "duckdb"], default="postgres", help="for .sql files")
+    sp = add("peek", cmd_peek, "look at a table's rows (peek users) or a column's values (peek orders.status)")
+    sp.add_argument("target", help="table, or table.column")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--timeout", type=int, default=core.DEFAULT_TIMEOUT_S)
     sp = add("check", cmd_check, "grade your answer")
     sp.add_argument("question")
     sp.add_argument("--file", help="answer file (default answers/NNN.sql)")

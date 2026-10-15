@@ -104,6 +104,27 @@ def run_query(sql: str, timeout_s: int = core.DEFAULT_TIMEOUT_S) -> Result:
         return Result([d[0] for d in cur.description], [[_text(v) for v in r] for r in rows], ms)
 
 
+def run_scratch(sql: str, limit: int, timeout_s: int = core.DEFAULT_TIMEOUT_S) -> Result:
+    """Run one exploratory statement; fetch at most `limit` rows."""
+    body = core.strip_sql(sql)
+    if not body:
+        raise QueryError("no SQL found (only comments)")
+    duckdb = _duckdb()
+    con = connect()
+    with _Guard(con, timeout_s):
+        try:
+            start = time.perf_counter()
+            cur = con.execute(body)
+            rows = cur.fetchmany(limit + 1) if cur.description else []
+            ms = (time.perf_counter() - start) * 1000
+        except duckdb.Error as e:
+            raise _error(e, timeout_s)
+        if cur.description is None:
+            return Result([], [], ms)
+        return Result([d[0] for d in cur.description], [[_text(v) for v in r] for r in rows[:limit]], ms,
+                      len(rows) > limit)
+
+
 def _table(cur, limit: int = 40) -> str:
     header = [d[0] for d in cur.description]
     rows = cur.fetchmany(limit + 1)

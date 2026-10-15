@@ -95,6 +95,91 @@ class TuiSmokeTest(unittest.TestCase):
             await self._settle(app, pilot)
             self.assertTrue(core.is_solved(core.load_progress(), q))
 
+    def test_scratch_and_peek(self):
+        asyncio.run(self._scratch_and_peek())
+
+    async def _scratch_and_peek(self):
+        """Scratch runs the statement under the cursor, caps rows, is read-only on plain questions,
+        never touches the answer; the Schema tab peeks at tables and columns."""
+        q = core.get_question(1)
+        app = DojoApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await self._settle(app, pilot)
+            app.load_question(q)
+            await self._settle(app, pilot)
+            await pilot.press("f2")
+            self.assertTrue(app.in_scratch())
+            scratch = app.query_one("#scratch")
+            info = app.query_one("#result-info")
+            table = app.query_one("#results")
+
+            scratch.load_text("SELECT 1 AS a;\n\nSELECT 2 AS b, 3 AS c;\n")
+            scratch.cursor_location = (2, 3)
+            await pilot.press("ctrl+r")
+            await self._settle(app, pilot)
+            self.assertEqual([str(c.label) for c in table.columns.values()], ["b", "c"])
+
+            scratch.load_text("SELECT generate_series(1, 5000) AS n;")
+            await pilot.press("ctrl+r")
+            await self._settle(app, pilot)
+            self.assertEqual(table.row_count, 1000)
+            self.assertIn("there are more", str(info.render()))
+
+            # values that look like Rich markup are shown as they are, and huge values don't crash
+            scratch.load_text("SELECT '[a-z]+' AS p, '[/b]' AS q, repeat('x', 200000) AS big;")
+            await pilot.press("ctrl+r")
+            await self._settle(app, pilot)
+            self.assertEqual([str(c) for c in table.get_row_at(0)[:2]], ["[a-z]+", "[/b]"])
+
+            # the cursor after a ';' with a trailing comment runs that statement, not the next one
+            scratch.load_text("SELECT 1 AS one; -- first\nSELECT 2 AS two;\n")
+            scratch.cursor_location = (0, 25)
+            await pilot.press("ctrl+r")
+            await self._settle(app, pilot)
+            self.assertEqual([str(c.label) for c in table.columns.values()], ["one"])
+
+            scratch.load_text("DELETE FROM users WHERE false;")
+            await pilot.press("ctrl+r")
+            await self._settle(app, pilot)
+            self.assertIn("read-only", str(info.render()))
+
+            app.save_scratch()
+            self.assertIn("DELETE FROM users", q.scratch_path.read_text())
+            self.assertNotIn("DELETE", q.answer_path.read_text())
+
+            # Ctrl+T grades the Answer tab, even from Scratch
+            app.query_one("#editor").load_text(q.solution_path.read_text())
+            await pilot.press("ctrl+t")
+            await self._settle(app, pilot)
+            self.assertTrue(core.is_solved(core.load_progress(), q))
+
+            tree = app.query_one("#schema")
+            orders = next(n for n in tree.root.children if n.data == {"table": "orders"})
+            tree.select_node(orders)
+            await self._settle(app, pilot)
+            self.assertIn("order_id", [str(c.label) for c in table.columns.values()])
+            status = next(n for n in orders.children if n.data["column"] == "status")
+            tree.select_node(status)
+            await self._settle(app, pilot)
+            self.assertEqual(str(next(iter(table.columns.values())).label), "status")
+            self.assertIn("delivered", [str(table.get_row_at(i)[0]) for i in range(table.row_count)])
+            tree.select_node(orders)  # collapsing the table keeps the column's values on screen
+            await self._settle(app, pilot)
+            self.assertFalse(orders.is_expanded)
+            self.assertEqual(str(next(iter(table.columns.values())).label), "status")
+
+    def test_fits_a_small_terminal(self):
+        asyncio.run(self._small_terminal())
+
+    async def _small_terminal(self):
+        app = DojoApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await self._settle(app, pilot)
+            for widget in ("#editor", "#status", "#bottom"):
+                region = app.query_one(widget).region
+                self.assertGreater(region.height, 0, widget)
+                self.assertLessEqual(region.bottom, 23, f"{widget} is off screen: {region}")
+
     @staticmethod
     async def _settle(app, pilot):
         await pilot.pause(0.3)

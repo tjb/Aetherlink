@@ -52,6 +52,12 @@ To use a database other than the compose one, set `DOJO_PSQL="psql postgresql://
 - `.github/workflows/`: CI (unit tests + generate at scale 0.05 + selftest + TUI smoke test) and an
   optional daily-question issue workflow (schedule commented out by default; also closes solved issues).
 - "Where you left off" lives in `answers/.session.json` (gitignored); `core.resume_question()`.
+- The TUI's Scratch tab (`answers/scratch/NNN.sql`, gitignored) runs the statement under the cursor
+  via `core.statement_at` + `core.scratch_query`: capped at `SCRATCH_ROWS` by wrapping plain queries
+  in `WITH scratch AS MATERIALIZED (...) SELECT * FROM scratch LIMIT n` (`core.limit_rows`; a CTE, not a
+  subquery, so the plan and timing match Check), and read-only (`default_transaction_read_only`) on
+  plain Postgres questions (`core.scratch_is_read_only`). Schema-tab peeks (`core.run_peek`, also
+  `./dojo peek`) sample tables over a million rows with TABLESAMPLE and label every estimate.
 
 ## Conventions for questions
 
